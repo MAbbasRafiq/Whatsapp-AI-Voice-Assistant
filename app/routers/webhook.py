@@ -12,6 +12,18 @@ supports two HTTP methods:
                        like "delivered"/"read", etc).
 
 Reference: https://developers.facebook.com/docs/graph-api/webhooks/getting-started
+
+Phase 3 adds a full security + persistence pipeline in front of message
+dispatch, run in this exact order for every incoming message:
+
+    1. X-Hub-Signature-256 verification (whole request, before anything
+       else is even parsed) — see app/services/security.py.
+    2. Ensure a `users` row exists + update last_seen.
+    3. Blocklist check (`users.is_blocked`) — silently ignored if true.
+    4. Dedup check (`messages.wa_message_id` unique constraint) — silently
+       ignored if this delivery was already processed (Meta retry).
+    5. Dispatch: voice/audio -> rate limit -> full processing pipeline;
+       "/command" text -> command handler; anything else -> default nudge.
 """
 
 import logging
@@ -19,15 +31,17 @@ import logging
 from fastapi import APIRouter, BackgroundTasks, Query, Request, Response, status
 
 from app.config import settings
+from app.services import db_ops
+from app.services.commands import DEFAULT_REPLY, handle_command, is_command
+from app.services.rate_limiter import check_and_record
+from app.services.security import verify_signature
 from app.services.voice_processing import process_voice_note
 from app.services.whatsapp import send_text_message
+from app.utils import mask_phone
 
 logger = logging.getLogger(__name__)
 
-# Shown to the user for any incoming message that isn't a voice/audio note
-# (plain text, images, stickers, etc.) — this bot's whole purpose is
-# turning voice notes into clean text, so we nudge users toward that.
-_NOT_A_VOICE_NOTE_REPLY = "🎤 Please send a voice note and I'll convert it to clean text for you!"
+_RATE_LIMITED_REPLY = "⏳ Please wait a few seconds before sending another voice note."
 
 router = APIRouter(tags=["webhook"])
 
@@ -69,19 +83,22 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks) -
     IMPORTANT: WhatsApp expects a fast 200 OK response. If we don't
     acknowledge quickly, Meta will consider the delivery failed and retry,
     which can lead to duplicate processing later. So this handler stays
-    lightweight: parse + log, then schedule all the real work (auto-reply
-    for non-voice messages, or the full download/transcribe/cleanup/reply
-    pipeline for voice notes) as BackgroundTasks so it runs *after* we've
-    already responded 200 to Meta below. A future phase may swap
-    BackgroundTasks for a proper task queue if reliability/retries become
-    a concern (BackgroundTasks don't survive a server restart mid-task).
+    lightweight: verify + parse + log, then schedule all the real work
+    (DB checks, dispatch, the full voice note pipeline, etc.) as a single
+    BackgroundTask per message so it runs *after* we've already responded
+    200 below. A future phase may swap BackgroundTasks for a proper task
+    queue if reliability/retries become a concern (BackgroundTasks don't
+    survive a server restart mid-task).
 
-    We also must never let a malformed/unexpected payload shape crash this
-    endpoint — WhatsApp sends other event types too (e.g. message status
-    updates like "delivered"/"read"), which have a different shape and
-    don't contain an actual user message. We defensively parse everything
-    and always return 200, even when there's nothing interesting to log.
+    Signature verification is the one thing that runs *before* returning
+    200 — an invalid signature means the request didn't come from Meta at
+    all, so it gets a 403 and no processing of any kind.
     """
+    raw_body = await request.body()
+
+    if not verify_signature(raw_body, request.headers.get("X-Hub-Signature-256")):
+        return Response(status_code=status.HTTP_403_FORBIDDEN)
+
     try:
         payload = await request.json()
     except Exception:
@@ -91,38 +108,78 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks) -
     logger.debug("Raw webhook payload: %s", payload)
 
     for message_info in _extract_messages(payload):
-        sender = message_info["from"]
-        message_type = message_info["type"]
-        content = message_info["content"]
-
-        logger.info(
-            "Incoming WhatsApp message | from=%s | type=%s | content=%s",
-            sender,
-            message_type,
-            content,
-        )
-
-        if message_type in ("audio", "voice"):
-            # `content` is the media ID for audio/voice messages (see
-            # `_parse_single_message` below). The full download -> convert
-            # -> transcribe -> cleanup -> reply pipeline lives in
-            # `app.services.voice_processing` and is scheduled as a
-            # background task so it runs *after* we return 200 to Meta
-            # below — required, since that pipeline involves several
-            # slow network calls (Graph API, ffmpeg, Groq) that would
-            # otherwise blow past WhatsApp's fast-ack requirement.
-            background_tasks.add_task(process_voice_note, media_id=content, sender=sender)
-        else:
-            # Anything else (text, image, sticker, location, etc.) gets a
-            # friendly nudge toward the bot's actual purpose. Also
-            # scheduled as a background task purely for consistency/
-            # symmetry with the voice note path above — a single text
-            # send is fast, but this keeps the response path uniform.
-            background_tasks.add_task(send_text_message, to=sender, message=_NOT_A_VOICE_NOTE_REPLY)
+        background_tasks.add_task(_handle_message, message_info)
 
     # Always acknowledge with 200 quickly, even if there was nothing to
     # parse (e.g. a status update) or the payload had an unexpected shape.
     return Response(status_code=status.HTTP_200_OK)
+
+
+async def _handle_message(message_info: dict) -> None:
+    """
+    Runs as a BackgroundTask, once per incoming message, *after* the
+    webhook has already returned 200 to Meta. Applies the user-record /
+    blocklist / dedup checks (Phase 3, Parts 3b/3c), then dispatches to
+    the voice note pipeline, a command handler, or the default reply.
+
+    Never lets an exception escape — this runs detached from any request
+    context, so an unhandled exception here would just vanish into
+    BackgroundTasks' internals rather than surfacing anywhere useful.
+    """
+    sender = message_info["from"]
+    wa_message_id = message_info["id"]
+    message_type = message_info["type"]
+    content = message_info["content"]
+
+    logger.info(
+        "Incoming WhatsApp message | from=%s | id=%s | type=%s",
+        mask_phone(sender),
+        wa_message_id,
+        message_type,
+    )
+
+    try:
+        user, is_new_user = await db_ops.touch_user(sender)
+
+        if user.is_blocked:
+            logger.info("Ignoring message from blocked user %s", mask_phone(sender))
+            return
+
+        is_new_delivery = await db_ops.record_message(wa_message_id, sender, status="received")
+        if not is_new_delivery:
+            # Duplicate webhook delivery (Meta retry) — already logged
+            # inside record_message(); skip silently, no reply.
+            return
+
+        if message_type in ("audio", "voice"):
+            if not check_and_record(sender):
+                await send_text_message(sender, _RATE_LIMITED_REPLY)
+                await db_ops.update_message_status(wa_message_id, "rate_limited")
+                return
+
+            await db_ops.update_message_status(wa_message_id, "queued")
+            await process_voice_note(
+                media_id=content,
+                sender=sender,
+                wa_message_id=wa_message_id,
+                is_new_user=is_new_user,
+                preferred_language=user.preferred_language,
+            )
+        elif message_type == "text" and is_command(content):
+            await handle_command(sender, content)
+            await db_ops.update_message_status(wa_message_id, "succeeded")
+        else:
+            # Anything else (plain text, image, sticker, location, etc.)
+            # gets a friendly nudge toward the bot's actual purpose.
+            await send_text_message(sender, DEFAULT_REPLY)
+            await db_ops.update_message_status(wa_message_id, "succeeded")
+
+    except Exception:
+        logger.exception(
+            "Unhandled error while processing message | from=%s | id=%s",
+            mask_phone(sender),
+            wa_message_id,
+        )
 
 
 def _extract_messages(payload: dict) -> list[dict]:
@@ -141,6 +198,7 @@ def _extract_messages(payload: dict) -> list[dict]:
                     "messages": [
                       {
                         "from": "15551234567",
+                        "id": "wamid.XXXX",
                         "type": "text" | "audio" | "voice" | ...,
                         "text": {"body": "hello"},                 # if type == "text"
                         "audio": {"id": "<media_id>", ...},          # if type == "audio"
@@ -160,7 +218,7 @@ def _extract_messages(payload: dict) -> list[dict]:
     shape. We simply skip anything that doesn't match, rather than
     treating it as an error.
 
-    Returns a list of dicts: {"from": str, "type": str, "content": str}
+    Returns a list of dicts: {"from": str, "id": str, "type": str, "content": str}
     where "content" is either the text body or a media ID (for
     audio/voice messages), depending on the message type.
     """
@@ -190,10 +248,11 @@ def _extract_messages(payload: dict) -> list[dict]:
 
 def _parse_single_message(message: dict) -> dict:
     """
-    Extract sender, type, and content/media-id from a single WhatsApp
-    message object, tolerating missing/unexpected fields.
+    Extract sender, message ID, type, and content/media-id from a single
+    WhatsApp message object, tolerating missing/unexpected fields.
     """
     sender = message.get("from", "unknown")
+    wa_message_id = message.get("id", "")
     message_type = message.get("type", "unknown")
 
     content: str
@@ -202,12 +261,12 @@ def _parse_single_message(message: dict) -> dict:
     elif message_type in ("audio", "voice"):
         # Audio/voice messages don't include the actual audio bytes here —
         # only a media ID, which must be fetched separately via the Graph
-        # API's media endpoint. That download/transcription flow is Phase 2.
+        # API's media endpoint (see app/services/whatsapp.py).
         content = message.get(message_type, {}).get("id", "")
     else:
         # Covers other WhatsApp message types (image, video, document,
         # location, contacts, sticker, interactive/button replies, etc.)
-        # which we don't handle yet in Phase 1.
+        # which we don't handle beyond the default nudge reply.
         content = f"<unsupported message type: {message_type}>"
 
-    return {"from": sender, "type": message_type, "content": content}
+    return {"from": sender, "id": wa_message_id, "type": message_type, "content": content}

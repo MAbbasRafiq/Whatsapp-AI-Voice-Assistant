@@ -38,6 +38,25 @@ class Settings(BaseSettings):
     # endpoint (transcript cleanup).
     groq_api_key: str = ""
 
+    # --- Phase 3: database ---------------------------------------------------
+    # Async SQLAlchemy connection string, e.g.
+    # postgresql+asyncpg://user:password@host:5432/dbname
+    # Must use the `+asyncpg` driver suffix — plain `postgresql://` would
+    # resolve to the sync psycopg2 driver, which doesn't work with our
+    # async engine/session setup.
+    database_url: str = ""
+
+    # --- Phase 3: security ---------------------------------------------------
+    # Meta App Dashboard -> App Settings -> Basic -> App Secret. Used to
+    # verify the X-Hub-Signature-256 header on every incoming webhook POST
+    # (HMAC-SHA256 of the raw request body) so we can reject requests that
+    # didn't actually come from Meta before doing any processing.
+    app_secret: str = ""
+
+    # --- Phase 3: usage limits ------------------------------------------------
+    # Max voice notes a single user can process per UTC calendar day.
+    daily_voice_limit: int = 20
+
     # --- General app settings ----------------------------------------------
     # "development", "staging", "production", etc. Defaults to "development".
     app_env: str = "development"

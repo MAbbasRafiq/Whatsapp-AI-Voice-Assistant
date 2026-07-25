@@ -13,6 +13,7 @@ setup required on any platform.
 
 import asyncio
 import logging
+import re
 import subprocess
 from pathlib import Path
 
@@ -22,6 +23,13 @@ from groq import AsyncGroq
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+# `imageio-ffmpeg` only bundles the `ffmpeg` binary, not `ffprobe`. Rather
+# than adding a second dependency just for duration checks, we get the
+# duration from ffmpeg itself: running it with no output target still
+# makes it print `Duration: HH:MM:SS.ms` to stderr while parsing the
+# input's headers. This regex pulls that out.
+_DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d\d):(\d\d)\.(\d+)")
 
 # Model IDs are plain strings (not enums) per Groq's API — see
 # https://console.groq.com/docs/speech-to-text and /docs/models.
@@ -91,6 +99,45 @@ async def convert_to_wav(input_path: Path, output_path: Path) -> None:
         stderr_text = exc.stderr.decode(errors="ignore") if exc.stderr else ""
         logger.error("ffmpeg conversion failed (exit=%s): %s", exc.returncode, stderr_text)
         raise
+
+
+async def probe_duration_seconds(input_path: Path) -> float:
+    """
+    Return the duration (in seconds) of an audio file using ffmpeg, used
+    for the "max 3 minutes" pre-check (Part 4) before spending time/money
+    on ffmpeg conversion + Whisper transcription for an oversized file.
+
+    ffmpeg always exits non-zero here (no `-f null` output target is
+    given, so it errors out after printing input info) — that's expected
+    and not treated as a failure; we only care about parsing "Duration:"
+    out of stderr. If duration can't be determined (corrupt file,
+    unexpected ffmpeg output), returns 0.0 and lets the rest of the
+    pipeline (ffmpeg conversion, Whisper) surface the real error instead.
+    """
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    cmd = [ffmpeg_exe, "-i", str(input_path)]
+
+    def _run_ffmpeg_probe() -> str:
+        result = subprocess.run(cmd, capture_output=True)
+        return result.stderr.decode(errors="ignore") if result.stderr else ""
+
+    stderr_text = await asyncio.to_thread(_run_ffmpeg_probe)
+
+    match = _DURATION_RE.search(stderr_text)
+    if not match:
+        logger.warning("Could not parse audio duration from ffmpeg output for %s", input_path)
+        return 0.0
+
+    hours, minutes, seconds, fraction = match.groups()
+    # `fraction` is centiseconds/milliseconds text (e.g. "45" in "01.45");
+    # treat it as decimal digits after the seconds' decimal point.
+    duration = (
+        int(hours) * 3600
+        + int(minutes) * 60
+        + int(seconds)
+        + float(f"0.{fraction}")
+    )
+    return duration
 
 
 async def transcribe_audio(audio_path: Path) -> tuple[str, str]:

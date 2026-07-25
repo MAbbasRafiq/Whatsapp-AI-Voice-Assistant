@@ -68,52 +68,116 @@ def resolve_effective_language(detected_language: str) -> str:
     return detected_language
 
 
-def _build_cleanup_system_prompt(detected_language: str) -> str:
+def _build_cleanup_system_prompt(detected_language: str, target_language: str | None = None) -> str:
     """
-    Build the cleanup system prompt with an explicit, strict language rule
-    based on what Whisper detected. This exists because without being told
-    the detected language up front, the cleanup LLM would sometimes drift
-    into translating the text (e.g. into English) or, worse, into a
-    completely unrelated language — the model would just "auto-continue"
-    in whatever language felt statistically likely rather than preserving
-    what was actually spoken.
+    Build the cleanup system prompt with an explicit, strict language rule.
+
+    Args:
+        detected_language: Whisper's detected spoken language for this
+            audio — always used to correctly interpret the input (e.g.
+            the Hindi/Urdu Devanagari mislabel below).
+        target_language: If None (default), the output must PRESERVE the
+            input's language/script as-is (original Phase 2 behavior —
+            used for a user's very first transcript, before they have a
+            language preference, or whenever preferred_language matches
+            what was actually spoken). If set to "english", "urdu", or
+            "roman", the output is instead forced into that language/
+            script regardless of what was spoken — used when a user has
+            set a `preferred_language` in `users.preferred_language`
+            that differs from the detected spoken language (Part 5).
+
+    Without being told the detected language up front, the cleanup LLM
+    would sometimes drift into translating the text (e.g. into English)
+    or, worse, into a completely unrelated language — the model would
+    just "auto-continue" in whatever language felt statistically likely
+    rather than preserving what was actually spoken.
     """
     original_language_key = (detected_language or "").strip().lower()
-    effective_language = resolve_effective_language(detected_language)
-    language_key = effective_language.strip().lower()
+    effective_source_language = resolve_effective_language(detected_language)
+    target_key = (target_language or "").strip().lower() or None
 
-    if language_key == "urdu" and original_language_key == "hindi":
-        # Whisper mislabeled Urdu speech as Hindi and wrote it phonetically
-        # in Devanagari script. The spoken content is correct — only the
-        # script is wrong — so this is a mechanical script conversion
-        # (Devanagari -> Urdu Nastaliq/Arabic script), NOT a translation.
+    if target_key is None:
+        # Preserve mode: keep the same language/script that was spoken.
+        language_key = effective_source_language.strip().lower()
+
+        if language_key == "urdu" and original_language_key == "hindi":
+            # Whisper mislabeled Urdu speech as Hindi and wrote it
+            # phonetically in Devanagari script. The spoken content is
+            # correct — only the script is wrong — so this is a
+            # mechanical script conversion (Devanagari -> Urdu Nastaliq/
+            # Arabic script), NOT a translation.
+            language_rule = (
+                "The detected language was reported as Hindi, written in "
+                "Devanagari script. However, spoken Hindi and spoken Urdu "
+                "(Hindustani) sound nearly identical, and this is actually "
+                "Urdu speech that was mis-scripted. Rewrite the input using "
+                "the Urdu Arabic script (اردو) instead of Devanagari — this "
+                "is a script conversion of the same words, NOT a translation "
+                "into a different language. NEVER use Roman Urdu (Latin "
+                "letters), and do not translate the meaning into English or "
+                "any other language."
+            )
+        elif language_key == "urdu":
+            language_rule = (
+                "The detected spoken language is Urdu. Your output MUST be "
+                "written in Urdu using the Urdu Arabic script (اردو) only. "
+                "NEVER use Roman Urdu (Urdu written with Latin/English "
+                "letters), and NEVER translate the text into English or any "
+                "other language."
+            )
+        elif language_key == "english":
+            language_rule = "The detected spoken language is English. Write the output in English."
+        else:
+            language_rule = (
+                f"The detected spoken language is '{effective_source_language}'. Keep "
+                "the output in that same language and in its native script — "
+                "do NOT translate it into English or any other language."
+            )
+        forbid_roman = True
+    elif target_key == "roman":
+        # Explicit override: user's preferred_language is "roman" — force
+        # Roman Urdu (Urdu spelled phonetically with Latin letters)
+        # regardless of what language/script was actually spoken/detected.
         language_rule = (
-            "The detected language was reported as Hindi, written in "
-            "Devanagari script. However, spoken Hindi and spoken Urdu "
-            "(Hindustani) sound nearly identical, and this is actually "
-            "Urdu speech that was mis-scripted. Rewrite the input using "
-            "the Urdu Arabic script (اردو) instead of Devanagari — this "
-            "is a script conversion of the same words, NOT a translation "
-            "into a different language. NEVER use Roman Urdu (Latin "
-            "letters), and do not translate the meaning into English or "
-            "any other language."
+            "Regardless of what language or script the input is written "
+            "in, your output MUST be written in Roman Urdu — i.e. Urdu "
+            "words spelled out phonetically using Latin/English letters "
+            "(e.g. 'Aap kaisay hain?' instead of 'آپ کیسے ہیں؟'). If the "
+            "input contains genuine English sentences/words, keep those "
+            "as normal English — do not force English content into Urdu "
+            "vocabulary — but any Urdu content must be transliterated "
+            "into Roman Urdu, never left in Urdu Arabic script and never "
+            "in Devanagari."
         )
-    elif language_key == "urdu":
+        forbid_roman = False
+    elif target_key == "urdu":
+        # Explicit override: force Urdu Arabic script even if the speech
+        # was detected as e.g. English — this is a deliberate translation
+        # into Urdu, requested via the user's saved preference.
         language_rule = (
-            "The detected spoken language is Urdu. Your output MUST be "
-            "written in Urdu using the Urdu Arabic script (اردو) only. "
-            "NEVER use Roman Urdu (Urdu written with Latin/English "
-            "letters), and NEVER translate the text into English or any "
-            "other language."
+            "Regardless of what language was actually spoken, your output "
+            "MUST be written in Urdu using the Urdu Arabic script (اردو) "
+            "only. Translate the content into natural, fluent Urdu if it "
+            "was not already in Urdu. NEVER use Roman Urdu (Latin "
+            "letters) and NEVER use Devanagari."
         )
-    elif language_key == "english":
-        language_rule = "The detected spoken language is English. Write the output in English."
+        forbid_roman = True
     else:
+        # target_key == "english" (or any other override we might add
+        # later) — deliberate translation into English.
         language_rule = (
-            f"The detected spoken language is '{effective_language}'. Keep "
-            "the output in that same language and in its native script — "
-            "do NOT translate it into English or any other language."
+            "Regardless of what language was actually spoken, your output "
+            "MUST be written in natural, fluent English. Translate the "
+            "content into English if it was not already in English."
         )
+        forbid_roman = True
+
+    roman_rule = (
+        "- NEVER transliterate any language into Roman/Latin script under any\n"
+        "  circumstances.\n"
+        if forbid_roman
+        else ""
+    )
 
     return f"""\
 You clean up raw voice-to-text transcripts for a WhatsApp voice notes app.
@@ -122,7 +186,7 @@ You are a transcript FORMATTER, not a summarizer. Your only job is to
 take the raw spoken-word transcript and lightly polish it — you are NOT
 writing a summary, a gist, or a shorter version of what was said.
 
-Detected language: {effective_language}
+Detected spoken language: {effective_source_language}
 
 Rules:
 - Remove filler words and verbal stumbles (um, uh, like, you know, etc.).
@@ -131,31 +195,28 @@ Rules:
 - Preserve the original meaning and tone exactly as spoken.
 - {language_rule}
 - If the speech mixes languages (e.g. Urdu and English in the same
-  recording), use Urdu Arabic script as the base, and keep any English
-  words that naturally appeared in the speech exactly as-is — do not
-  translate them into Urdu and do not transliterate them.
-- NEVER transliterate any language into Roman/Latin script under any
-  circumstances.
-- CRITICAL — NO DEVANAGARI SCRIPT, EVER: your output must NEVER contain
-  any Devanagari (Hindi-script) characters, even a single word, even if
-  most of the input is already correctly in Urdu Arabic script. Spoken
-  Urdu and spoken Hindi sound identical, so Whisper sometimes writes a
-  few scattered words of the SAME Urdu speech in Devanagari script by
-  mistake, even inside an otherwise-Urdu transcript. Whenever you see
-  Devanagari characters anywhere in the input, they are mis-scripted
-  Urdu, NOT a foreign-language insertion to preserve — rewrite every
-  such word or phrase as the natural Urdu word a native Urdu speaker
-  would actually use for that same meaning. This is NOT a letter-by-
+  recording) and you are not translating to a different target language,
+  use Urdu Arabic script as the base, and keep any English words that
+  naturally appeared in the speech exactly as-is — do not translate them
+  into Urdu and do not transliterate them.
+{roman_rule}- CRITICAL — NO DEVANAGARI SCRIPT, EVER: your output must NEVER contain
+  any Devanagari (Hindi-script) characters, even a single word. Spoken
+  Urdu and spoken Hindi sound identical, so input text sometimes contains
+  a few scattered words written in Devanagari script by mistake, even
+  inside an otherwise-Urdu transcript. Whenever you see Devanagari
+  characters anywhere in the input, they are mis-scripted Urdu, NOT a
+  foreign-language insertion to preserve — rewrite every such word or
+  phrase as the natural Urdu word a native Urdu speaker would actually
+  use for that same meaning (in whatever script/form your target output
+  requires — Arabic script or Roman Urdu). This is NOT a letter-by-
   letter phonetic transliteration — Hindi and Urdu often use different
   vocabulary for the same everyday words (e.g. "उपलब्ध" is Hindi for
   "available", but a native Urdu speaker would say "دستیاب", not a
   phonetic spelling of "उपलब्ध"). Use your knowledge of natural,
   everyday spoken Urdu to pick the equivalent word or phrase, exactly
-  as if the speaker had said that word in Urdu to begin with. Only
-  genuine English words (Latin script) should ever be preserved as-is;
-  Devanagari must always be fully converted, never preserved and never
-  left mixed in — the final output must be 100% Urdu Arabic script
-  (plus any genuine English words), with zero Devanagari characters.
+  as if the speaker had said that word in Urdu to begin with. Devanagari
+  must always be fully converted, never preserved and never left mixed
+  in — the final output must have zero Devanagari characters.
 - CRITICAL — DO NOT SUMMARIZE: the cleaned-up text must preserve every
   idea, sentence, and detail from the original speech, and must be
   roughly the same length as the raw transcript (only shorter by the
@@ -203,21 +264,30 @@ _EXAMPLE_MIXED_SCRIPT_CLEANED = (
 )
 
 
-async def cleanup_transcript(raw_transcript: str, detected_language: str) -> str:
+async def cleanup_transcript(
+    raw_transcript: str,
+    detected_language: str,
+    target_language: str | None = None,
+) -> str:
     """
     Send a raw transcript to a Groq-hosted LLM (llama-3.3-70b-versatile)
     for cleanup: removes filler words, fixes punctuation/paragraphs, and
-    keeps the original language, meaning, and full content intact (no
-    summarizing — see `_build_cleanup_system_prompt` and the few-shot
-    example below for how that's enforced).
+    keeps the original meaning and full content intact (no summarizing —
+    see `_build_cleanup_system_prompt` and the few-shot example below for
+    how that's enforced).
 
     Args:
         raw_transcript: The raw Whisper transcript text.
         detected_language: Whisper's detected language (e.g. "english",
             "urdu") from `app.services.transcription.transcribe_audio`.
-            Passed explicitly so the cleanup LLM knows exactly what
-            language/script to preserve, rather than guessing — see
-            `_build_cleanup_system_prompt`.
+            Passed explicitly so the cleanup LLM knows exactly what was
+            spoken, rather than guessing.
+        target_language: If None (default), the output preserves
+            whatever language/script was actually spoken (Phase 2
+            behavior). If "english"/"urdu"/"roman", forces the output
+            into that language/script instead — used when the user has a
+            saved `preferred_language` that differs from what they
+            actually spoke this time (Part 5 of Phase 3).
 
     Returns the cleaned text. Raises on API failure — the caller (the
     voice note processing pipeline) is responsible for turning that into
@@ -230,7 +300,7 @@ async def cleanup_transcript(raw_transcript: str, detected_language: str) -> str
         return ""
 
     client = _get_groq_client()
-    system_prompt = _build_cleanup_system_prompt(detected_language)
+    system_prompt = _build_cleanup_system_prompt(detected_language, target_language)
 
     messages: list[dict[str, str]] = [
         {"role": "system", "content": system_prompt},
@@ -300,3 +370,67 @@ async def cleanup_transcript(raw_transcript: str, detected_language: str) -> str
             )
 
     return cleaned
+
+
+async def translate_transcript(cleaned_text: str, source_language: str) -> str:
+    """
+    Re-run the LLM on an already-cleaned transcript (from the in-memory
+    last-transcript cache — see app/services/voice_processing.py) to
+    translate it into English. Used by the `/translate` command.
+
+    Deliberately reuses the same cleanup prompt machinery (via
+    `target_language="english"`) rather than a bespoke prompt — the
+    "don't summarize" / "preserve every detail" rules apply here just as
+    much as they do for the initial cleanup.
+    """
+    return await cleanup_transcript(cleaned_text, source_language, target_language="english")
+
+
+_SUMMARIZE_LANGUAGE_LABELS = {
+    "urdu": "Urdu, written in the Urdu Arabic script (اردو)",
+    "english": "English",
+    "roman": "Roman Urdu (Urdu spelled phonetically with Latin letters)",
+}
+
+
+def _build_summarize_system_prompt(target_language: str) -> str:
+    language_key = (target_language or "").strip().lower()
+    language_label = _SUMMARIZE_LANGUAGE_LABELS.get(language_key, target_language or "the same language as the input")
+
+    return f"""\
+You summarize voice note transcripts for a WhatsApp voice notes app.
+
+Summarize the input text into a short list of concise bullet points
+capturing only the key ideas — unlike transcript cleanup, brevity here IS
+the goal.
+
+Rules:
+- Write the summary in {language_label}.
+- Use "- " bullet points, one idea per line.
+- Keep it concise: only the key points, not every detail.
+- Do not add information that wasn't in the original text.
+- Reply with ONLY the bullet points. No preamble, no closing remarks, no
+  wrapping quotation marks.
+"""
+
+
+async def summarize_transcript(cleaned_text: str, target_language: str) -> str:
+    """
+    Re-run the LLM on an already-cleaned transcript to produce a concise
+    bullet-point summary, in `target_language` (the user's preferred
+    language if set, otherwise the transcript's own detected language).
+    Used by the `/summarize` command.
+    """
+    if not cleaned_text.strip():
+        return ""
+
+    client = _get_groq_client()
+    completion = await client.chat.completions.create(
+        model=CLEANUP_MODEL,
+        messages=[
+            {"role": "system", "content": _build_summarize_system_prompt(target_language)},
+            {"role": "user", "content": cleaned_text},
+        ],
+        temperature=0.2,
+    )
+    return (completion.choices[0].message.content or "").strip()
