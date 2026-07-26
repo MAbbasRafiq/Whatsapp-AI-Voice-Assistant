@@ -11,7 +11,7 @@ itself (no `Base.metadata.create_all()` anywhere) — that's Alembic's job.
 
 from datetime import date, datetime
 
-from sqlalchemy import Boolean, Date, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 
@@ -24,8 +24,12 @@ class User(Base):
     __tablename__ = "users"
 
     wa_phone: Mapped[str] = mapped_column(String, primary_key=True)
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
-    last_seen: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    last_seen: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
     # "urdu" | "english" | "roman" | None (no preference set yet).
     preferred_language: Mapped[str | None] = mapped_column(String, nullable=True)
     is_blocked: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
@@ -44,7 +48,9 @@ class Message(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     wa_message_id: Mapped[str] = mapped_column(String, unique=True, nullable=False)
     wa_phone: Mapped[str] = mapped_column(ForeignKey("users.wa_phone"), nullable=False)
-    received_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
     # received | skipped_dup | rate_limited | queued | succeeded | failed
     status: Mapped[str] = mapped_column(String, nullable=False, default="received")
 
@@ -71,6 +77,8 @@ class Transcript(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     wa_phone: Mapped[str] = mapped_column(ForeignKey("users.wa_phone"), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
     language: Mapped[str] = mapped_column(String, nullable=False)
     text: Mapped[str] = mapped_column(Text, nullable=False)
