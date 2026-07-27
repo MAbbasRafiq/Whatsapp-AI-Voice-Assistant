@@ -57,6 +57,20 @@ class Settings(BaseSettings):
     # Max voice notes a single user can process per UTC calendar day.
     daily_voice_limit: int = 20
 
+    # --- Supabase Storage (background voice archival) ------------------------
+    # Project URL from Supabase Dashboard → Project Settings → API.
+    # Used only to archive raw voice notes; never blocks user replies.
+    supabase_url: str = ""
+
+    # Service role key (secret) from the same API page. Bypasses Storage RLS
+    # so the bot can write to the private voice-recordings bucket. Never
+    # expose this key in client-side code.
+    supabase_service_role_key: str = ""
+
+    # Private Storage bucket name for archived voice notes. Object keys are
+    # <phone_number>/<whatsapp_message_id>.<ext> inside this bucket.
+    supabase_storage_bucket: str = "voice-recordings"
+
     # --- General app settings ----------------------------------------------
     # "development", "staging", "production", etc. Defaults to "development".
     app_env: str = "development"

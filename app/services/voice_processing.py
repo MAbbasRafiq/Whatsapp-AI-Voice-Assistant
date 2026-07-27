@@ -34,6 +34,7 @@ from app.services.transcript_cache import set_last_transcript
 from app.services.transcription import convert_to_wav, probe_duration_seconds, transcribe_audio
 from app.services.user_errors import ErrorType, classify_for_voice_pipeline, send_user_error
 from app.services.user_state import clear_waiting_for_language
+from app.services.voice_storage import schedule_voice_upload
 from app.services.whatsapp import download_media, get_media_info, send_long_message, send_text_message
 from app.utils import log_voice_note_event, mask_phone
 
@@ -95,7 +96,7 @@ async def process_voice_note(
             )
 
         # --- Download + pre-checks --------------------------------------
-        media_url, reported_file_size = await get_media_info(media_id)
+        media_url, reported_file_size, mime_type = await get_media_info(media_id)
 
         if reported_file_size is not None and reported_file_size > MAX_FILE_SIZE_BYTES:
             await send_user_error(sender, ErrorType.FILE_TOO_LARGE)
@@ -110,6 +111,11 @@ async def process_voice_note(
             await _safe_update_status(wa_message_id, "failed")
             _log_result(sender, wa_message_id, "failed", None, None, timings, 0, "file_too_large", start_time)
             return
+
+        # Archive raw audio in the background — never awaited. Failures
+        # are logged inside voice_storage and cannot delay transcription
+        # or WhatsApp replies.
+        schedule_voice_upload(audio_bytes, sender, wa_message_id, mime_type)
 
         with tempfile.TemporaryDirectory(prefix="voicenotes_") as tmp_dir:
             tmp_path = Path(tmp_dir)

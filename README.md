@@ -110,7 +110,8 @@ voicenotes/
 │       ├── commands.py            # /translate /summarize /urdu /english /roman /help
 │       ├── transcription.py       # ffmpeg conversion, duration probe, Groq Whisper transcription
 │       ├── llm.py                 # Groq LLM cleanup/translate/summarize prompts
-│       └── voice_processing.py    # orchestrates the full voice-note pipeline
+│       ├── voice_processing.py    # orchestrates the full voice-note pipeline
+│       └── voice_storage.py       # fire-and-forget Supabase Storage archival of raw voice notes
 ├── migrations/                    # Alembic migration scripts (async)
 ├── alembic.ini
 ├── Procfile                       # Railway/Heroku-style process declaration
@@ -154,6 +155,9 @@ GROQ_API_KEY=your_groq_api_key_here
 DATABASE_URL=postgresql+asyncpg://user:password@host:5432/dbname
 APP_SECRET=your_meta_app_secret_here
 DAILY_VOICE_LIMIT=20
+SUPABASE_URL=https://your-project-ref.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=your_supabase_service_role_key_here
+SUPABASE_STORAGE_BUCKET=voice-recordings
 APP_ENV=development
 ```
 
@@ -175,10 +179,31 @@ APP_ENV=development
   this check get an immediate `403` before any other processing.
 - `DAILY_VOICE_LIMIT` (default `20`) is the max voice notes a single user
   can process per UTC calendar day.
+- `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` come from **Supabase
+  Dashboard → Project Settings → API**. Used only to archive raw voice
+  notes to a private Storage bucket in the background (never blocks
+  replies). Leave blank to skip archival.
+- `SUPABASE_STORAGE_BUCKET` (default `voice-recordings`) is the private
+  bucket name. Object keys are
+  `<phone_number>/<whatsapp_message_id>.ogg` (or the original extension).
 
 **Never commit your real `.env` file** — it's already excluded via
 `.gitignore`. All code reads credentials exclusively from environment
 variables via `app/config.py`; nothing is hardcoded.
+
+### Supabase Storage bucket (voice archival)
+
+Create a **private** bucket once in the Supabase dashboard (Storage → New
+bucket):
+
+1. Name: `voice-recordings` (must match `SUPABASE_STORAGE_BUCKET`).
+2. Public bucket: **off** (keep private).
+3. No extra Postgres tables or app-side RLS policies are required — the
+   bot uploads with the **service role** key, which bypasses Storage RLS.
+
+Uploads are scheduled with `asyncio.create_task` right after a successful
+media download and are **never awaited** before transcription or WhatsApp
+replies. Upload failures are logged only.
 
 ## 3. Set up the database
 
@@ -290,7 +315,9 @@ are logged as last-4-digits only, for privacy).
    environment variables, since that's the driver our async engine uses).
 2. Set the remaining environment variables in the Railway service
    (`WHATSAPP_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_VERIFY_TOKEN`,
-   `GROQ_API_KEY`, `APP_SECRET`, `DAILY_VOICE_LIMIT`, `APP_ENV=production`).
+   `GROQ_API_KEY`, `APP_SECRET`, `DAILY_VOICE_LIMIT`, `SUPABASE_URL`,
+   `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_STORAGE_BUCKET`,
+   `APP_ENV=production`).
 3. Deploy. Railway uses `railway.toml` (nixpacks builder, start command,
    `/health` healthcheck) — no `Procfile` changes needed for Railway
    specifically, but it's included for Heroku-style compatibility too.

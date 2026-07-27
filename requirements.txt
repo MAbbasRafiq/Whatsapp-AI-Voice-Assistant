@@ -8,3 +8,4 @@ imageio-ffmpeg
 asyncpg
 sqlalchemy[asyncio]
 alembic
+supabase

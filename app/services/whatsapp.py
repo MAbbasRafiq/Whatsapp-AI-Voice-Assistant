@@ -214,10 +214,10 @@ async def send_list_message(
     return await _post_message(to, payload, log_label="list message")
 
 
-async def get_media_info(media_id: str) -> tuple[str, int | None]:
+async def get_media_info(media_id: str) -> tuple[str, int | None, str | None]:
     """
     Resolve a WhatsApp media ID into a temporary, authenticated download
-    URL, plus the file size in bytes if Meta reports one.
+    URL, plus the file size in bytes and mime_type if Meta reports them.
 
     Incoming audio/voice/image/etc. messages in the webhook payload never
     contain the actual file — only this ID. This is step 1 of 2 for
@@ -230,6 +230,9 @@ async def get_media_info(media_id: str) -> tuple[str, int | None]:
     reject an oversized voice note (Part 4's 25MB check) *before*
     spending time/bandwidth on `download_media` — Meta's media-lookup
     response usually already includes it, so this is effectively free.
+
+    `mime_type` (when present) is used only for background voice archival
+    file extensions — it does not change transcription/reply behavior.
 
     Raises on any failure (missing config, HTTP error, unexpected
     response shape) — callers are expected to catch and turn this into a
@@ -252,7 +255,12 @@ async def get_media_info(media_id: str) -> tuple[str, int | None]:
         raise RuntimeError(f"Graph API media lookup for {media_id!r} returned no 'url' field: {data}")
 
     file_size = data.get("file_size")
-    return media_url, (int(file_size) if file_size is not None else None)
+    mime_type = data.get("mime_type")
+    return (
+        media_url,
+        (int(file_size) if file_size is not None else None),
+        (str(mime_type) if mime_type else None),
+    )
 
 
 async def download_media(media_url: str) -> bytes:
