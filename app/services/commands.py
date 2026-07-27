@@ -165,9 +165,13 @@ async def handle_command(wa_phone: str, text: str) -> None:
             await _handle_set_preference(wa_phone, command)
         elif command == "help":
             help_text = _HELP_TEXT_SLASH_TEMPLATE.format(daily_limit=settings.daily_voice_limit)
-            await send_text_message(wa_phone, help_text)
+            sent = await send_text_message(wa_phone, help_text)
+            if not sent:
+                logger.error("Failed to send /help reply | wa_phone=%s", mask_phone(wa_phone))
         else:
-            await send_text_message(wa_phone, DEFAULT_REPLY)
+            sent = await send_text_message(wa_phone, DEFAULT_REPLY)
+            if not sent:
+                logger.error("Failed to send default command reply | wa_phone=%s", mask_phone(wa_phone))
     except Exception as exc:
         logger.exception(
             "Command handling failed | wa_phone=%s | command=%s",
@@ -190,7 +194,9 @@ async def handle_interactive(wa_phone: str, reply_id: str, reply_title: str = ""
         elif reply_id == BTN_SUMMARIZE:
             await _summarize_last(wa_phone)
         elif reply_id == BTN_HELP:
-            await send_text_message(wa_phone, _HELP_TEXT)
+            sent = await send_text_message(wa_phone, _HELP_TEXT)
+            if not sent:
+                logger.error("Failed to send Help reply | wa_phone=%s", mask_phone(wa_phone))
         elif reply_id == LANG_OTHER:
             await _prompt_other_language(wa_phone)
         elif reply_id in _LANG_ID_TO_TARGET:
@@ -228,8 +234,9 @@ async def handle_language_input(wa_phone: str, language_text: str) -> None:
 
     language = language_text.strip()
     if not language:
-        await send_user_error(wa_phone, ErrorType.EMPTY_LANGUAGE)
-        set_waiting_for_language(wa_phone)
+        sent = await send_user_error(wa_phone, ErrorType.EMPTY_LANGUAGE)
+        if sent:
+            set_waiting_for_language(wa_phone)
         return
 
     # Ignore accidental slash-looking input while waiting — treat the
@@ -237,8 +244,9 @@ async def handle_language_input(wa_phone: str, language_text: str) -> None:
     if language.startswith("/"):
         language = language.lstrip("/").strip()
         if not language:
-            await send_user_error(wa_phone, ErrorType.EMPTY_LANGUAGE)
-            set_waiting_for_language(wa_phone)
+            sent = await send_user_error(wa_phone, ErrorType.EMPTY_LANGUAGE)
+            if sent:
+                set_waiting_for_language(wa_phone)
             return
 
     try:
@@ -273,11 +281,16 @@ async def _start_translate_flow(wa_phone: str) -> None:
             "List message failed; falling back to /translate English | wa_phone=%s",
             mask_phone(wa_phone),
         )
-        await send_text_message(
+        notice_sent = await send_text_message(
             wa_phone,
             "Interactive menus unavailable. Translating to English…\n"
             f"(Or use {_SLASH_FALLBACK_FOOTER})",
         )
+        if not notice_sent:
+            logger.error(
+                "Failed to send list-fallback notice | wa_phone=%s",
+                mask_phone(wa_phone),
+            )
         await _translate_last(wa_phone, "English")
 
 
@@ -287,8 +300,35 @@ async def _prompt_other_language(wa_phone: str) -> None:
         await send_user_error(wa_phone, ErrorType.NO_TRANSCRIPT)
         return
 
+    # Only enter waiting mode after the prompt is actually delivered —
+    # otherwise the user is stuck treating their next message as a language
+    # name without ever seeing the ask.
+    sent = await send_text_message(wa_phone, _ASK_OTHER_LANGUAGE)
+    if not sent:
+        logger.error(
+            "Failed to send 'type a language' prompt; not entering waiting mode | wa_phone=%s",
+            mask_phone(wa_phone),
+        )
+        return
     set_waiting_for_language(wa_phone)
-    await send_text_message(wa_phone, _ASK_OTHER_LANGUAGE)
+
+
+async def _send_post_action_buttons(wa_phone: str, *, context: str) -> None:
+    """Send Reply Buttons after a successful result, with slash-footer fallback."""
+    buttons_sent = await send_post_transcript_actions(wa_phone)
+    if not buttons_sent:
+        logger.warning(
+            "Reply buttons failed after %s; sending slash-command fallback | wa_phone=%s",
+            context,
+            mask_phone(wa_phone),
+        )
+        fallback_sent = await send_text_message(wa_phone, slash_command_fallback_footer())
+        if not fallback_sent:
+            logger.error(
+                "Failed to send slash-command fallback after %s | wa_phone=%s",
+                context,
+                mask_phone(wa_phone),
+            )
 
 
 async def _translate_last(wa_phone: str, target_language: str) -> None:
@@ -317,7 +357,17 @@ async def _translate_last(wa_phone: str, target_language: str) -> None:
         return
 
     clear_waiting_for_language(wa_phone)
-    await send_long_message(wa_phone, translated)
+    translated_sent = await send_long_message(wa_phone, translated)
+    if not translated_sent:
+        logger.error(
+            "Failed to deliver translation | wa_phone=%s | target=%r",
+            mask_phone(wa_phone),
+            target_language,
+        )
+        await send_user_error(wa_phone, ErrorType.WHATSAPP_TEMP_FAILURE)
+        return
+
+    await _send_post_action_buttons(wa_phone, context="translate")
 
 
 async def _summarize_last(wa_phone: str) -> None:
@@ -349,19 +399,26 @@ async def _summarize_last(wa_phone: str) -> None:
         await send_user_error(wa_phone, ErrorType.REQUEST_FAILED)
         return
 
-    await send_long_message(wa_phone, summary)
+    summary_sent = await send_long_message(wa_phone, summary)
+    if not summary_sent:
+        logger.error(
+            "Failed to deliver summary | wa_phone=%s",
+            mask_phone(wa_phone),
+        )
+        await send_user_error(wa_phone, ErrorType.WHATSAPP_TEMP_FAILURE)
+        return
 
     # Re-offer the same post-transcript Reply Buttons so the user can keep
     # interacting (Translate / Summarize again / Help) without resending.
-    buttons_sent = await send_post_transcript_actions(wa_phone)
-    if not buttons_sent:
-        logger.warning(
-            "Reply buttons failed after summarize; sending slash-command fallback | wa_phone=%s",
-            mask_phone(wa_phone),
-        )
-        await send_text_message(wa_phone, slash_command_fallback_footer())
+    await _send_post_action_buttons(wa_phone, context="summarize")
 
 
 async def _handle_set_preference(wa_phone: str, language: str) -> None:
     await db_ops.set_preferred_language(wa_phone, language)
-    await send_text_message(wa_phone, _PREFERENCE_SAVED_REPLIES[language])
+    sent = await send_text_message(wa_phone, _PREFERENCE_SAVED_REPLIES[language])
+    if not sent:
+        logger.error(
+            "Failed to send preference-saved confirmation | wa_phone=%s | language=%s",
+            mask_phone(wa_phone),
+            language,
+        )

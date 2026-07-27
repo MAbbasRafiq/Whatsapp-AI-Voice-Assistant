@@ -195,8 +195,16 @@ async def _handle_message(message_info: dict) -> None:
         else:
             # Anything else (plain text, image, sticker, location, etc.)
             # gets a friendly nudge toward the bot's actual purpose.
-            await send_text_message(sender, DEFAULT_REPLY)
-            await _safe_update_message_status(wa_message_id, "succeeded")
+            sent = await send_text_message(sender, DEFAULT_REPLY)
+            if not sent:
+                logger.error(
+                    "Failed to send default nudge reply | from=%s | id=%s",
+                    mask_phone(sender),
+                    wa_message_id,
+                )
+                await _safe_update_message_status(wa_message_id, "failed")
+            else:
+                await _safe_update_message_status(wa_message_id, "succeeded")
 
     except Exception as exc:
         logger.exception(

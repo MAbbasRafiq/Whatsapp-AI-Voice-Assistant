@@ -375,9 +375,19 @@ async def cleanup_transcript(
 _BUILTIN_TRANSLATE_TARGETS = {
     "english": "english",
     "urdu": "urdu",
-    "roman": "roman",
-    "roman urdu": "roman",
+    # Roman Urdu is handled by a dedicated translate path — reusing
+    # cleanup_transcript pulls in English few-shot examples and a
+    # "formatter" persona that often drifts into plain English.
 }
+
+
+def _normalize_language_key(language: str) -> str:
+    return " ".join((language or "").strip().lower().replace("-", " ").replace("_", " ").split())
+
+
+def _is_roman_urdu_target(target_language: str) -> bool:
+    key = _normalize_language_key(target_language)
+    return key in {"roman", "roman urdu", "urdu roman"}
 
 
 def _build_translate_system_prompt(source_language: str, target_language: str) -> str:
@@ -392,13 +402,52 @@ Rules:
 - Preserve every idea, sentence, and detail — do NOT summarize.
 - Keep the original meaning and tone.
 - Write fluent, natural {target}.
-- If the target is Roman Urdu, spell Urdu phonetically with Latin letters.
 - If the target is Urdu (not Roman), use Urdu Arabic script (اردو) only —
-  never Devanagari.
+  never Devanagari and never Roman/Latin letters for Urdu words.
 - Do not add information that wasn't in the original text.
 - Reply with ONLY the translated text. No preamble, no explanations, no
   wrapping quotation marks.
 """
+
+
+_ROMAN_URDU_SYSTEM_PROMPT = """\
+You convert voice note transcripts into Roman Urdu for a WhatsApp voice notes app.
+
+Roman Urdu = Urdu written phonetically with Latin/English letters
+(e.g. "Aap kaise hain?" instead of "آپ کیسے ہیں؟" or "How are you?").
+
+CRITICAL — DO NOT WRITE ENGLISH:
+- Your output must read as spoken Urdu in Latin script, NOT as English.
+- Wrong: "How are you? I have a meeting tomorrow."
+- Right: "Aap kaise hain? Meri kal meeting hai."
+- Wrong: "I wanted to talk about the project timeline."
+- Right: "Main project timeline ke baare mein baat karna chahta tha."
+
+Rules:
+- If the input is Urdu Arabic script (or Devanagari), convert it into
+  natural Roman Urdu — same words/meaning, Latin letters.
+- If the input is English (or another language), translate the meaning
+  into natural spoken Roman Urdu — do NOT leave it as English sentences.
+- Keep common English loanwords that Urdu speakers actually say in
+  English (meeting, project, deadline, OK, etc.) inside the Roman Urdu
+  sentence — but the sentence frame must still be Roman Urdu.
+- Preserve every idea, sentence, and detail — do NOT summarize.
+- Never use Urdu Arabic script or Devanagari in the output.
+- Reply with ONLY the Roman Urdu text. No preamble, no explanations, no
+  wrapping quotation marks.
+"""
+
+_EXAMPLE_ROMAN_URDU_SRC_URDU = "آپ کیسے ہیں؟ کل میٹنگ ہے اور مجھے دفتر جانا ہے۔"
+_EXAMPLE_ROMAN_URDU_OUT_URDU = "Aap kaise hain? Kal meeting hai aur mujhe daftar jana hai."
+
+_EXAMPLE_ROMAN_URDU_SRC_EN = (
+    "I wanted to talk to you about the project timeline. "
+    "I think we need to push the deadline back by two weeks."
+)
+_EXAMPLE_ROMAN_URDU_OUT_EN = (
+    "Main aap se project timeline ke baare mein baat karna chahta tha. "
+    "Mujhe lagta hai hamein deadline ko do haftay peeche dhakelna hoga."
+)
 
 
 async def translate_transcript(
@@ -410,9 +459,10 @@ async def translate_transcript(
     Translate an already-cleaned transcript (from the in-memory last-
     transcript cache) into `target_language` without re-running Whisper.
 
-    Built-in targets english / urdu / roman reuse the cleanup machinery
-    (same "don't summarize" guarantees). Any other language name gets a
-    dedicated translation prompt so Arabic, French, Chinese, etc. work.
+    Built-in targets english / urdu reuse the cleanup machinery (same
+    "don't summarize" guarantees). Roman Urdu uses a dedicated prompt so
+    the model does not drift into plain English. Any other language name
+    gets a dedicated translation prompt (Arabic, French, Chinese, etc.).
     """
     if not cleaned_text.strip():
         return ""
@@ -420,6 +470,9 @@ async def translate_transcript(
     target_key = (target_language or "").strip().lower()
     if not target_key:
         raise ValueError("target_language must not be empty")
+
+    if _is_roman_urdu_target(target_language):
+        return await _translate_to_roman_urdu(cleaned_text)
 
     builtin = _BUILTIN_TRANSLATE_TARGETS.get(target_key)
     if builtin is not None:
@@ -435,6 +488,24 @@ async def translate_transcript(
                 "role": "system",
                 "content": _build_translate_system_prompt(source_language, target_language),
             },
+            {"role": "user", "content": cleaned_text},
+        ],
+        temperature=0.2,
+    )
+    return (completion.choices[0].message.content or "").strip()
+
+
+async def _translate_to_roman_urdu(cleaned_text: str) -> str:
+    """Dedicated Roman Urdu path with few-shot examples (Urdu + English inputs)."""
+    client = _get_groq_client()
+    completion = await client.chat.completions.create(
+        model=CLEANUP_MODEL,
+        messages=[
+            {"role": "system", "content": _ROMAN_URDU_SYSTEM_PROMPT},
+            {"role": "user", "content": _EXAMPLE_ROMAN_URDU_SRC_URDU},
+            {"role": "assistant", "content": _EXAMPLE_ROMAN_URDU_OUT_URDU},
+            {"role": "user", "content": _EXAMPLE_ROMAN_URDU_SRC_EN},
+            {"role": "assistant", "content": _EXAMPLE_ROMAN_URDU_OUT_EN},
             {"role": "user", "content": cleaned_text},
         ],
         temperature=0.2,

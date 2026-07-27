@@ -86,7 +86,13 @@ async def process_voice_note(
             _log_result(sender, wa_message_id, "failed", None, None, timings, 0, "daily_limit_exceeded", start_time)
             return
 
-        await send_text_message(sender, PROCESSING_MESSAGE)
+        processing_sent = await send_text_message(sender, PROCESSING_MESSAGE)
+        if not processing_sent:
+            logger.error(
+                "Failed to send processing acknowledgement | sender=%s | id=%s",
+                mask_phone(sender),
+                wa_message_id,
+            )
 
         # --- Download + pre-checks --------------------------------------
         media_url, reported_file_size = await get_media_info(media_id)
@@ -154,7 +160,27 @@ async def process_voice_note(
         set_last_transcript(sender, cleaned_text, final_language_key)
 
         reply = f"🌐 Language: {display_label}\n\n{cleaned_text}"
-        await send_long_message(sender, reply)
+        transcript_sent = await send_long_message(sender, reply)
+        if not transcript_sent:
+            logger.error(
+                "Failed to deliver transcript message | sender=%s | id=%s",
+                mask_phone(sender),
+                wa_message_id,
+            )
+            await send_user_error(sender, ErrorType.WHATSAPP_TEMP_FAILURE)
+            await _safe_update_status(wa_message_id, "failed")
+            _log_result(
+                sender,
+                wa_message_id,
+                "failed",
+                detected_language,
+                audio_duration_sec,
+                timings,
+                transcript_char_count,
+                "transcript_send_failed",
+                start_time,
+            )
+            return
 
         # Second message: interactive Reply Buttons. If Meta rejects the
         # interactive payload (permissions, API issues, etc.), fall back
@@ -165,7 +191,12 @@ async def process_voice_note(
                 "Reply buttons failed; sending slash-command fallback | sender=%s",
                 mask_phone(sender),
             )
-            await send_text_message(sender, slash_command_fallback_footer())
+            fallback_sent = await send_text_message(sender, slash_command_fallback_footer())
+            if not fallback_sent:
+                logger.error(
+                    "Failed to send slash-command fallback after transcript | sender=%s",
+                    mask_phone(sender),
+                )
 
         await _safe_update_status(wa_message_id, "succeeded")
         _log_result(
