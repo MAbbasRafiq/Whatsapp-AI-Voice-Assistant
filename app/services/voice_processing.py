@@ -3,9 +3,9 @@ End-to-end voice note processing pipeline.
 
 Orchestrates: daily-quota check -> download audio from WhatsApp -> file
 size / duration pre-checks -> convert to WAV -> transcribe with Groq
-Whisper -> clean up with a Groq LLM (honoring any saved language
-preference) -> save transcript + reply to the user on WhatsApp -> log a
-structured analytics event.
+Whisper -> clean up with a Groq LLM (always in the original detected
+language — no auto-translate) -> save transcript + reply on WhatsApp
+with interactive Reply Buttons -> log a structured analytics event.
 
 Designed to run as a FastAPI `BackgroundTask`, scheduled from the webhook
 router *after* WhatsApp has already been acknowledged with a 200 (see
@@ -17,8 +17,8 @@ is ever called — this module assumes the caller has already decided
 Every step can fail independently (media URL expired, corrupt audio,
 ffmpeg error, Groq API down/rate-limited, etc). On any failure, we log
 the full exception for debugging and send the user a single friendly
-error message instead of leaving them without any reply at all (Part 9)
-— never a raw/internal error message.
+error message instead of leaving them without any reply at all —
+never a raw/internal error message.
 """
 
 import logging
@@ -28,9 +28,11 @@ from pathlib import Path
 
 from app.config import settings
 from app.services import db_ops
+from app.services.commands import send_post_transcript_actions, slash_command_fallback_footer
 from app.services.llm import cleanup_transcript, resolve_effective_language
 from app.services.transcript_cache import set_last_transcript
 from app.services.transcription import convert_to_wav, probe_duration_seconds, transcribe_audio
+from app.services.user_state import clear_waiting_for_language
 from app.services.whatsapp import download_media, get_media_info, send_long_message, send_text_message
 from app.utils import log_voice_note_event, mask_phone
 
@@ -59,19 +61,6 @@ _DAILY_LIMIT_MESSAGE_TEMPLATE = (
     "⚠️ You've used all {limit} voice notes for today.\nResets at midnight UTC. See you tomorrow! 🌙"
 )
 
-_ONBOARDING_FOOTER_TEMPLATE = """\
-
-💡 I used {language} for this transcript.
-Want to set a permanent preference?
-
-/urdu — Always reply in اردو
-/english — Always reply in English
-/roman — Always reply in Roman Urdu
-
-You can change this anytime."""
-
-_STANDARD_FOOTER = "──────────────\n💡 /translate • /summarize • /roman • /help"
-
 _LANGUAGE_DISPLAY_LABELS = {
     "urdu": "Urdu",
     "english": "English",
@@ -83,8 +72,6 @@ async def process_voice_note(
     media_id: str,
     sender: str,
     wa_message_id: str,
-    is_new_user: bool,
-    preferred_language: str | None,
 ) -> None:
     """
     Full pipeline for a single incoming voice/audio message.
@@ -93,12 +80,7 @@ async def process_voice_note(
         media_id: The WhatsApp media ID from the incoming message payload.
         sender: The sender's WhatsApp phone number.
         wa_message_id: This message's WhatsApp ID, used to update its
-            `messages.status` row as processing proceeds (Part 3b).
-        is_new_user: Whether this is the very first message we've ever
-            seen from this phone number (decides onboarding vs. regular
-            footer — Part 5/6).
-        preferred_language: The user's saved `preferred_language`
-            ("urdu"/"english"/"roman"), or None if not set yet.
+            `messages.status` row as processing proceeds.
     """
     start_time = time.monotonic()
     timings = {"transcription_time_sec": None, "llm_cleanup_time_sec": None}
@@ -106,9 +88,12 @@ async def process_voice_note(
     audio_duration_sec = None
     transcript_char_count = 0
 
+    # A new voice note always cancels any pending "Other language..." wait.
+    clear_waiting_for_language(sender)
+
     try:
-        # --- Daily quota check (Part 3e) — before any download, so an
-        # over-quota user doesn't cost us bandwidth/ffmpeg time. ---------
+        # --- Daily quota check — before any download, so an over-quota
+        # user doesn't cost us bandwidth/ffmpeg time. --------------------
         new_count = await db_ops.increment_daily_usage(sender)
         if new_count > settings.daily_voice_limit:
             await send_text_message(
@@ -120,7 +105,7 @@ async def process_voice_note(
 
         await send_text_message(sender, PROCESSING_MESSAGE)
 
-        # --- Download + pre-checks (Part 4) -----------------------------
+        # --- Download + pre-checks --------------------------------------
         media_url, reported_file_size = await get_media_info(media_id)
 
         if reported_file_size is not None and reported_file_size > MAX_FILE_SIZE_BYTES:
@@ -166,34 +151,39 @@ async def process_voice_note(
             )
             return
 
-        # --- Cleanup, honoring a saved language preference (Part 5) ----
+        # --- Cleanup in the ORIGINAL detected language (no auto-translate)
         effective_detected = resolve_effective_language(detected_language)
-        target_language = None
-        if preferred_language and preferred_language.strip().lower() != effective_detected.strip().lower():
-            target_language = preferred_language.strip().lower()
 
         cleanup_start = time.monotonic()
-        cleaned_text = await cleanup_transcript(raw_transcript, detected_language, target_language=target_language)
+        cleaned_text = await cleanup_transcript(
+            raw_transcript, detected_language, target_language=None
+        )
         timings["llm_cleanup_time_sec"] = round(time.monotonic() - cleanup_start, 2)
         transcript_char_count = len(cleaned_text)
 
-        final_language_key = target_language or effective_detected.strip().lower()
+        final_language_key = effective_detected.strip().lower()
         display_label = _LANGUAGE_DISPLAY_LABELS.get(final_language_key, final_language_key.title())
 
         # Persist + cache before replying — if sending the reply fails
         # partway through chunking, the transcript is still safely saved
-        # and available to /translate, /summarize, and future /history.
+        # and available to Translate / Summarize.
         await db_ops.save_transcript(sender, final_language_key, cleaned_text)
         set_last_transcript(sender, cleaned_text, final_language_key)
 
-        footer = (
-            _ONBOARDING_FOOTER_TEMPLATE.format(language=display_label)
-            if is_new_user
-            else f"\n\n{_STANDARD_FOOTER}"
-        )
-        reply = f"🌐 Language: {display_label}\n\n{cleaned_text}\n\n{footer.strip()}"
-
+        reply = f"🌐 Language: {display_label}\n\n{cleaned_text}"
         await send_long_message(sender, reply)
+
+        # Second message: interactive Reply Buttons. If Meta rejects the
+        # interactive payload (permissions, API issues, etc.), fall back
+        # to the legacy slash-command footer so the user isn't stuck.
+        buttons_sent = await send_post_transcript_actions(sender)
+        if not buttons_sent:
+            logger.warning(
+                "Reply buttons failed; sending slash-command fallback | sender=%s",
+                mask_phone(sender),
+            )
+            await send_text_message(sender, slash_command_fallback_footer())
+
         await db_ops.update_message_status(wa_message_id, "succeeded")
         _log_result(
             sender, wa_message_id, "success", detected_language, audio_duration_sec, timings, transcript_char_count, None, start_time
@@ -229,7 +219,7 @@ def _log_result(
     error: str | None,
     start_time: float,
 ) -> None:
-    """Emit the Part 10 structured analytics log line for one attempt."""
+    """Emit the structured analytics log line for one attempt."""
     log_voice_note_event(
         event="voice_note_processed",
         wa_phone=mask_phone(wa_phone),

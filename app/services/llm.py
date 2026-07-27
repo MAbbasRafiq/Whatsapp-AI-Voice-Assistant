@@ -372,18 +372,74 @@ async def cleanup_transcript(
     return cleaned
 
 
-async def translate_transcript(cleaned_text: str, source_language: str) -> str:
-    """
-    Re-run the LLM on an already-cleaned transcript (from the in-memory
-    last-transcript cache — see app/services/voice_processing.py) to
-    translate it into English. Used by the `/translate` command.
+_BUILTIN_TRANSLATE_TARGETS = {
+    "english": "english",
+    "urdu": "urdu",
+    "roman": "roman",
+    "roman urdu": "roman",
+}
 
-    Deliberately reuses the same cleanup prompt machinery (via
-    `target_language="english"`) rather than a bespoke prompt — the
-    "don't summarize" / "preserve every detail" rules apply here just as
-    much as they do for the initial cleanup.
+
+def _build_translate_system_prompt(source_language: str, target_language: str) -> str:
+    source = resolve_effective_language(source_language) or "the source language"
+    target = (target_language or "").strip() or "English"
+    return f"""\
+You translate voice note transcripts for a WhatsApp voice notes app.
+
+Translate the input text from {source} into {target}.
+
+Rules:
+- Preserve every idea, sentence, and detail — do NOT summarize.
+- Keep the original meaning and tone.
+- Write fluent, natural {target}.
+- If the target is Roman Urdu, spell Urdu phonetically with Latin letters.
+- If the target is Urdu (not Roman), use Urdu Arabic script (اردو) only —
+  never Devanagari.
+- Do not add information that wasn't in the original text.
+- Reply with ONLY the translated text. No preamble, no explanations, no
+  wrapping quotation marks.
+"""
+
+
+async def translate_transcript(
+    cleaned_text: str,
+    source_language: str,
+    target_language: str = "english",
+) -> str:
     """
-    return await cleanup_transcript(cleaned_text, source_language, target_language="english")
+    Translate an already-cleaned transcript (from the in-memory last-
+    transcript cache) into `target_language` without re-running Whisper.
+
+    Built-in targets english / urdu / roman reuse the cleanup machinery
+    (same "don't summarize" guarantees). Any other language name gets a
+    dedicated translation prompt so Arabic, French, Chinese, etc. work.
+    """
+    if not cleaned_text.strip():
+        return ""
+
+    target_key = (target_language or "").strip().lower()
+    if not target_key:
+        raise ValueError("target_language must not be empty")
+
+    builtin = _BUILTIN_TRANSLATE_TARGETS.get(target_key)
+    if builtin is not None:
+        return await cleanup_transcript(
+            cleaned_text, source_language, target_language=builtin
+        )
+
+    client = _get_groq_client()
+    completion = await client.chat.completions.create(
+        model=CLEANUP_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": _build_translate_system_prompt(source_language, target_language),
+            },
+            {"role": "user", "content": cleaned_text},
+        ],
+        temperature=0.2,
+    )
+    return (completion.choices[0].message.content or "").strip()
 
 
 _SUMMARIZE_LANGUAGE_LABELS = {

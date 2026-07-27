@@ -1,10 +1,15 @@
 """
-Text-command handling.
+Text-command and interactive-message handling.
+
+Primary UX is WhatsApp Reply Buttons + List Messages after each
+transcript. Slash commands (`/translate`, `/summarize`, `/help`, etc.)
+remain as a fallback when interactive sends fail or a user types them
+directly.
 
 Any incoming text message starting with "/" is treated as a command
-(case-insensitive, surrounding whitespace ignored). Anything else that
-isn't a voice/audio note falls through to a generic nudge reply — see
-`DEFAULT_REPLY` below, sent by the webhook router directly.
+(case-insensitive, surrounding whitespace ignored). Interactive button/
+list replies are routed through `handle_interactive`. Plain text while
+`waiting_for_language` is handled by `handle_language_input`.
 """
 
 import logging
@@ -13,21 +18,91 @@ from app.config import settings
 from app.services import db_ops
 from app.services.llm import resolve_effective_language, summarize_transcript, translate_transcript
 from app.services.transcript_cache import get_last_transcript
-from app.services.whatsapp import send_long_message, send_text_message
+from app.services.user_state import (
+    clear_waiting_for_language,
+    is_waiting_for_language,
+    set_waiting_for_language,
+)
+from app.services.whatsapp import (
+    send_list_message,
+    send_long_message,
+    send_reply_buttons,
+    send_text_message,
+)
 from app.utils import mask_phone
 
 logger = logging.getLogger(__name__)
 
-NO_TRANSCRIPT_REPLY = "⚠️ No recent transcript found. Please send a voice note first."
+# --- Interactive message IDs (must match what we send) --------------------
+BTN_TRANSLATE = "action_translate"
+BTN_SUMMARIZE = "action_summarize"
+BTN_HELP = "action_help"
+
+LANG_ENGLISH = "lang_english"
+LANG_URDU = "lang_urdu"
+LANG_ROMAN = "lang_roman"
+LANG_ARABIC = "lang_arabic"
+LANG_FRENCH = "lang_french"
+LANG_CHINESE = "lang_chinese"
+LANG_OTHER = "lang_other"
+
+_LANG_ID_TO_TARGET: dict[str, str] = {
+    LANG_ENGLISH: "English",
+    LANG_URDU: "Urdu",
+    LANG_ROMAN: "Roman Urdu",
+    LANG_ARABIC: "Arabic",
+    LANG_FRENCH: "French",
+    LANG_CHINESE: "Chinese",
+}
+
+_POST_TRANSCRIPT_BUTTONS: list[tuple[str, str]] = [
+    (BTN_TRANSLATE, "🌍 Translate"),
+    (BTN_SUMMARIZE, "📝 Summarize"),
+    (BTN_HELP, "❓ Help"),
+]
+
+_LANGUAGE_LIST_ROWS: list[tuple[str, str]] = [
+    (LANG_ENGLISH, "English"),
+    (LANG_URDU, "Urdu"),
+    (LANG_ROMAN, "🔤 Roman Urdu"),
+    (LANG_ARABIC, "Arabic"),
+    (LANG_FRENCH, "French"),
+    (LANG_CHINESE, "Chinese"),
+    (LANG_OTHER, "✍️ Other language..."),
+]
+
+NO_TRANSCRIPT_REPLY = (
+    "I couldn't find a recent transcript.\n"
+    "Remember voice expires after 15 min\n"
+    "Send a new voice note."
+)
 
 _GENERIC_ERROR_REPLY = (
     "⚠️ Something went wrong while processing your request. Please try again in a minute."
 )
 
+_UNSUPPORTED_LANGUAGE_REPLY = (
+    "⚠️ I couldn't translate into that language. "
+    "Please try a common language name (e.g. Spanish, German, Turkish)."
+)
+
+_EMPTY_LANGUAGE_REPLY = (
+    "🌍 Type the language you'd like to translate into."
+)
+
+_ASK_OTHER_LANGUAGE = "🌍 Type the language you'd like to translate into."
+
+_WAITING_EXPIRED_REPLY = (
+    "⏳ That language request expired. "
+    "Send a voice note or tap Translate again."
+)
+
 DEFAULT_REPLY = (
     "🎤 Send me a voice note and I'll convert it to clean text!\n\n"
-    "Or use /help to see available commands."
+    "Or tap Help after a transcript for tips."
 )
+
+_SLASH_FALLBACK_FOOTER = "──────────────\n💡 /translate • /summarize • /roman • /help"
 
 _PREFERENCE_SAVED_REPLIES = {
     "urdu": "✅ Preference saved! I'll use اردو for all future transcripts.",
@@ -35,7 +110,17 @@ _PREFERENCE_SAVED_REPLIES = {
     "roman": "✅ Preference saved! I'll use Roman Urdu for all future transcripts.",
 }
 
-_HELP_TEXT_TEMPLATE = """\
+_HELP_TEXT = """\
+🤖 Voice Assistant
+• Send a voice note to receive a transcript.
+• Use Translate to convert it into another language.
+• Use Summarize to generate key points.
+• The voice message expires after 15 min
+
+To translate into any language not listed,
+choose Other language... and simply type the language name."""
+
+_HELP_TEXT_SLASH_TEMPLATE = """\
 🎤 VoiceNotes — Commands
 
 /translate — Translate last transcript to English
@@ -54,10 +139,28 @@ def is_command(text: str) -> bool:
     return text.strip().startswith("/")
 
 
+async def send_post_transcript_actions(wa_phone: str) -> bool:
+    """
+    Send the three Reply Buttons that follow every successful transcript.
+
+    Returns True if the interactive message was accepted. Callers should
+    fall back to the slash-command footer text when this returns False.
+    """
+    return await send_reply_buttons(
+        wa_phone,
+        body="What would you like to do next?",
+        buttons=_POST_TRANSCRIPT_BUTTONS,
+    )
+
+
+def slash_command_fallback_footer() -> str:
+    """Text footer used when Reply Buttons cannot be delivered."""
+    return _SLASH_FALLBACK_FOOTER
+
+
 async def handle_command(wa_phone: str, text: str) -> None:
     """
-    Parse and execute a single command message, sending the appropriate
-    reply (or replies, for long /translate /summarize output) directly.
+    Parse and execute a single slash-command message.
 
     Unknown "/whatever" commands fall back to the same generic nudge as
     non-command text, rather than a confusing silent no-op.
@@ -66,32 +169,169 @@ async def handle_command(wa_phone: str, text: str) -> None:
 
     try:
         if command == "translate":
-            await _handle_translate(wa_phone)
+            await _translate_last(wa_phone, "English")
         elif command == "summarize":
-            await _handle_summarize(wa_phone)
+            await _summarize_last(wa_phone)
         elif command in ("urdu", "english", "roman"):
             await _handle_set_preference(wa_phone, command)
         elif command == "help":
-            await _handle_help(wa_phone)
+            help_text = _HELP_TEXT_SLASH_TEMPLATE.format(daily_limit=settings.daily_voice_limit)
+            await send_text_message(wa_phone, help_text)
         else:
             await send_text_message(wa_phone, DEFAULT_REPLY)
     except Exception:
-        logger.exception("Command handling failed | wa_phone=%s | command=%s", mask_phone(wa_phone), command)
+        logger.exception(
+            "Command handling failed | wa_phone=%s | command=%s",
+            mask_phone(wa_phone),
+            command,
+        )
         await send_text_message(wa_phone, _GENERIC_ERROR_REPLY)
 
 
-async def _handle_translate(wa_phone: str) -> None:
+async def handle_interactive(wa_phone: str, reply_id: str, reply_title: str = "") -> None:
+    """
+    Handle a WhatsApp interactive button_reply or list_reply.
+
+    `reply_id` is the stable id we set when sending the interactive
+    message; `reply_title` is only used for logging / unknown-id fallback.
+    """
+    try:
+        if reply_id == BTN_TRANSLATE:
+            await _start_translate_flow(wa_phone)
+        elif reply_id == BTN_SUMMARIZE:
+            await _summarize_last(wa_phone)
+        elif reply_id == BTN_HELP:
+            await send_text_message(wa_phone, _HELP_TEXT)
+        elif reply_id == LANG_OTHER:
+            await _prompt_other_language(wa_phone)
+        elif reply_id in _LANG_ID_TO_TARGET:
+            await _translate_last(wa_phone, _LANG_ID_TO_TARGET[reply_id])
+        else:
+            logger.warning(
+                "Unknown interactive reply id=%r title=%r | wa_phone=%s",
+                reply_id,
+                reply_title,
+                mask_phone(wa_phone),
+            )
+            await send_text_message(wa_phone, DEFAULT_REPLY)
+    except Exception:
+        logger.exception(
+            "Interactive handling failed | wa_phone=%s | reply_id=%s",
+            mask_phone(wa_phone),
+            reply_id,
+        )
+        await send_text_message(wa_phone, _GENERIC_ERROR_REPLY)
+
+
+async def handle_language_input(wa_phone: str, language_text: str) -> None:
+    """
+    Handle the plain-text reply that follows "Other language...".
+
+    Clears pending state whether translation succeeds or fails, so the
+    user isn't stuck in waiting mode. If the waiting flag already expired,
+    tells them to start Translate again.
+    """
+    if not is_waiting_for_language(wa_phone):
+        await send_text_message(wa_phone, _WAITING_EXPIRED_REPLY)
+        return
+
+    clear_waiting_for_language(wa_phone)
+
+    language = language_text.strip()
+    if not language:
+        await send_text_message(wa_phone, _EMPTY_LANGUAGE_REPLY)
+        set_waiting_for_language(wa_phone)
+        return
+
+    # Ignore accidental slash-looking input while waiting — treat the
+    # whole string as a language name (e.g. user typed "/spanish" by habit).
+    if language.startswith("/"):
+        language = language.lstrip("/").strip()
+        if not language:
+            await send_text_message(wa_phone, _EMPTY_LANGUAGE_REPLY)
+            set_waiting_for_language(wa_phone)
+            return
+
+    try:
+        await _translate_last(wa_phone, language)
+    except Exception:
+        logger.exception(
+            "Language-input translation failed | wa_phone=%s | language=%r",
+            mask_phone(wa_phone),
+            language,
+        )
+        await send_text_message(wa_phone, _GENERIC_ERROR_REPLY)
+
+
+async def _start_translate_flow(wa_phone: str) -> None:
+    """Show the language list, or fall back to slash-style English translate."""
+    if get_last_transcript(wa_phone) is None:
+        await send_text_message(wa_phone, NO_TRANSCRIPT_REPLY)
+        return
+
+    sent = await send_list_message(
+        wa_phone,
+        body="Pick a language for the translation:",
+        button_text="Languages",
+        rows=_LANGUAGE_LIST_ROWS,
+        header="Choose target language",
+        section_title="Languages",
+    )
+    if not sent:
+        # Interactive list unavailable — fall back to English translate
+        # (same as legacy /translate) so the user still gets a result.
+        logger.warning(
+            "List message failed; falling back to /translate English | wa_phone=%s",
+            mask_phone(wa_phone),
+        )
+        await send_text_message(
+            wa_phone,
+            "Interactive menus unavailable. Translating to English…\n"
+            f"(Or use {_SLASH_FALLBACK_FOOTER})",
+        )
+        await _translate_last(wa_phone, "English")
+
+
+async def _prompt_other_language(wa_phone: str) -> None:
+    if get_last_transcript(wa_phone) is None:
+        clear_waiting_for_language(wa_phone)
+        await send_text_message(wa_phone, NO_TRANSCRIPT_REPLY)
+        return
+
+    set_waiting_for_language(wa_phone)
+    await send_text_message(wa_phone, _ASK_OTHER_LANGUAGE)
+
+
+async def _translate_last(wa_phone: str, target_language: str) -> None:
     cached = get_last_transcript(wa_phone)
     if cached is None:
+        clear_waiting_for_language(wa_phone)
         await send_text_message(wa_phone, NO_TRANSCRIPT_REPLY)
         return
 
     text, language = cached
-    translated = await translate_transcript(text, language)
+    try:
+        translated = await translate_transcript(text, language, target_language=target_language)
+    except Exception:
+        logger.exception(
+            "translate_transcript failed | wa_phone=%s | target=%r",
+            mask_phone(wa_phone),
+            target_language,
+        )
+        await send_text_message(wa_phone, _UNSUPPORTED_LANGUAGE_REPLY)
+        clear_waiting_for_language(wa_phone)
+        return
+
+    if not translated.strip():
+        await send_text_message(wa_phone, _UNSUPPORTED_LANGUAGE_REPLY)
+        clear_waiting_for_language(wa_phone)
+        return
+
+    clear_waiting_for_language(wa_phone)
     await send_long_message(wa_phone, translated)
 
 
-async def _handle_summarize(wa_phone: str) -> None:
+async def _summarize_last(wa_phone: str) -> None:
     cached = get_last_transcript(wa_phone)
     if cached is None:
         await send_text_message(wa_phone, NO_TRANSCRIPT_REPLY)
@@ -107,8 +347,3 @@ async def _handle_summarize(wa_phone: str) -> None:
 async def _handle_set_preference(wa_phone: str, language: str) -> None:
     await db_ops.set_preferred_language(wa_phone, language)
     await send_text_message(wa_phone, _PREFERENCE_SAVED_REPLIES[language])
-
-
-async def _handle_help(wa_phone: str) -> None:
-    help_text = _HELP_TEXT_TEMPLATE.format(daily_limit=settings.daily_voice_limit)
-    await send_text_message(wa_phone, help_text)

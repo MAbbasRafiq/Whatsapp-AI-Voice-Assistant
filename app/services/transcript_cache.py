@@ -1,25 +1,25 @@
 """
 In-memory "last transcript" cache, keyed by phone number.
 
-Used by the `/translate` and `/summarize` commands to re-run the LLM on
-a user's most recent cleaned transcript without re-running Whisper
-(cheaper, faster, and Whisper output doesn't change between calls
-anyway). Plain in-process dict, same trade-offs as `rate_limiter.py` —
-resets on restart, single-process only, which is fine at this app's
-scale.
+Used by Translate / Summarize (interactive buttons and slash-command
+fallbacks) to re-run the LLM on a user's most recent cleaned transcript
+without re-running Whisper (cheaper, faster, and Whisper output doesn't
+change between calls anyway). Plain in-process dict, same trade-offs as
+`rate_limiter.py` — resets on restart, single-process only, which is fine
+at this app's scale.
 
 Each new voice note simply overwrites the previous entry for that phone
 number (there's only ever "the most recent transcript" per user, not a
-history) and entries expire after `CACHE_TTL_SECONDS` so `/translate` on
-a days-old transcript correctly reports "no recent transcript" rather
-than resurfacing stale content.
+history) and entries expire after `CACHE_TTL_SECONDS` so Translate on a
+stale transcript correctly reports "no recent transcript" rather than
+resurfacing old content.
 """
 
 import time
 from dataclasses import dataclass
 from threading import Lock
 
-CACHE_TTL_SECONDS = 10 * 60
+CACHE_TTL_SECONDS = 15 * 60
 
 
 @dataclass

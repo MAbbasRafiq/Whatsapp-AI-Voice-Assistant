@@ -40,6 +40,50 @@ _MAX_CHUNKS = 3
 _TRUNCATION_SUFFIX = " ... [truncated]"
 
 
+async def _post_message(to: str, payload: dict, log_label: str) -> bool:
+    """
+    Shared POST helper for every outbound WhatsApp Cloud API message.
+
+    Returns True on HTTP 2xx, False on config/HTTP/network failure.
+    Errors are logged and never raised so callers can fall back gracefully.
+    """
+    if not settings.whatsapp_token or not settings.whatsapp_phone_number_id:
+        logger.error(
+            "Cannot send WhatsApp message: WHATSAPP_TOKEN or "
+            "WHATSAPP_PHONE_NUMBER_ID is not configured. Check your .env file."
+        )
+        return False
+
+    url = f"{GRAPH_API_BASE_URL}/{settings.whatsapp_phone_number_id}/messages"
+    headers = {
+        "Authorization": f"Bearer {settings.whatsapp_token}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+            response = await client.post(url, headers=headers, json=payload)
+
+        if response.is_success:
+            logger.info("Sent WhatsApp %s to %s", log_label, to)
+            return True
+
+        logger.error(
+            "Failed to send WhatsApp %s to %s. Status=%s Response=%s",
+            log_label,
+            to,
+            response.status_code,
+            response.text,
+        )
+        return False
+
+    except httpx.RequestError as exc:
+        logger.exception(
+            "Network error while sending WhatsApp %s to %s: %s", log_label, to, exc
+        )
+        return False
+
+
 async def send_text_message(to: str, message: str) -> bool:
     """
     Send a plain text WhatsApp message to a given phone number.
@@ -56,20 +100,6 @@ async def send_text_message(to: str, message: str) -> bool:
         False otherwise. Errors are logged, never raised, so a failed
         send doesn't crash the caller (e.g. the webhook handler).
     """
-    if not settings.whatsapp_token or not settings.whatsapp_phone_number_id:
-        logger.error(
-            "Cannot send WhatsApp message: WHATSAPP_TOKEN or "
-            "WHATSAPP_PHONE_NUMBER_ID is not configured. Check your .env file."
-        )
-        return False
-
-    url = f"{GRAPH_API_BASE_URL}/{settings.whatsapp_phone_number_id}/messages"
-
-    headers = {
-        "Authorization": f"Bearer {settings.whatsapp_token}",
-        "Content-Type": "application/json",
-    }
-
     # Standard WhatsApp Cloud API payload shape for a plain text message.
     # https://developers.facebook.com/docs/whatsapp/cloud-api/reference/messages
     payload = {
@@ -82,28 +112,106 @@ async def send_text_message(to: str, message: str) -> bool:
             "body": message,
         },
     }
+    return await _post_message(to, payload, log_label=f"text message: {message!r}")
 
-    try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
-            response = await client.post(url, headers=headers, json=payload)
 
-        if response.is_success:
-            logger.info("Sent WhatsApp message to %s: %r", to, message)
-            return True
+async def send_reply_buttons(
+    to: str,
+    body: str,
+    buttons: list[tuple[str, str]],
+) -> bool:
+    """
+    Send a WhatsApp interactive Reply Buttons message (max 3 buttons).
 
-        # Meta returns a JSON error body with useful details on failure.
+    Args:
+        to: Recipient phone number.
+        body: Body text shown above the buttons (required by the API).
+        buttons: Up to 3 `(button_id, title)` pairs. Titles must be ≤20
+            characters (WhatsApp Cloud API limit).
+
+    Returns True if accepted by the Graph API, False otherwise.
+    """
+    if not buttons or len(buttons) > 3:
         logger.error(
-            "Failed to send WhatsApp message to %s. Status=%s Response=%s",
-            to,
-            response.status_code,
-            response.text,
+            "send_reply_buttons requires 1–3 buttons, got %d", len(buttons)
         )
         return False
 
-    except httpx.RequestError as exc:
-        # Network-level failure (timeout, DNS, connection refused, etc.)
-        logger.exception("Network error while sending WhatsApp message to %s: %s", to, exc)
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": to,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {"text": body},
+            "action": {
+                "buttons": [
+                    {
+                        "type": "reply",
+                        "reply": {"id": button_id, "title": title[:20]},
+                    }
+                    for button_id, title in buttons
+                ]
+            },
+        },
+    }
+    return await _post_message(to, payload, log_label="reply buttons")
+
+
+async def send_list_message(
+    to: str,
+    body: str,
+    button_text: str,
+    rows: list[tuple[str, str]],
+    *,
+    header: str | None = None,
+    section_title: str = "Options",
+) -> bool:
+    """
+    Send a WhatsApp interactive List Message.
+
+    Args:
+        to: Recipient phone number.
+        body: Body text shown above the list button.
+        button_text: Label on the button that opens the list (≤20 chars).
+        rows: `(row_id, title)` pairs (titles ≤24 chars). Max 10 rows.
+        header: Optional header text (used as the list title).
+        section_title: Section heading inside the list (≤24 chars).
+
+    Returns True if accepted by the Graph API, False otherwise.
+    """
+    if not rows or len(rows) > 10:
+        logger.error("send_list_message requires 1–10 rows, got %d", len(rows))
         return False
+
+    interactive: dict = {
+        "type": "list",
+        "body": {"text": body},
+        "action": {
+            "button": button_text[:20],
+            "sections": [
+                {
+                    "title": section_title[:24],
+                    "rows": [
+                        {"id": row_id, "title": title[:24]}
+                        for row_id, title in rows
+                    ],
+                }
+            ],
+        },
+    }
+    if header:
+        interactive["header"] = {"type": "text", "text": header[:60]}
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": to,
+        "type": "interactive",
+        "interactive": interactive,
+    }
+    return await _post_message(to, payload, log_label="list message")
 
 
 async def get_media_info(media_id: str) -> tuple[str, int | None]:

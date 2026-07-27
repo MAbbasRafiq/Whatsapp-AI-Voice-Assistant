@@ -13,8 +13,8 @@ supports two HTTP methods:
 
 Reference: https://developers.facebook.com/docs/graph-api/webhooks/getting-started
 
-Phase 3 adds a full security + persistence pipeline in front of message
-dispatch, run in this exact order for every incoming message:
+Security + persistence pipeline, run in this exact order for every
+incoming message:
 
     1. X-Hub-Signature-256 verification (whole request, before anything
        else is even parsed) — see app/services/security.py.
@@ -23,6 +23,8 @@ dispatch, run in this exact order for every incoming message:
     4. Dedup check (`messages.wa_message_id` unique constraint) — silently
        ignored if this delivery was already processed (Meta retry).
     5. Dispatch: voice/audio -> rate limit -> full processing pipeline;
+       interactive button/list replies -> interactive handler;
+       plain text while waiting_for_language -> language input handler;
        "/command" text -> command handler; anything else -> default nudge.
 """
 
@@ -32,9 +34,16 @@ from fastapi import APIRouter, BackgroundTasks, Query, Request, Response, status
 
 from app.config import settings
 from app.services import db_ops
-from app.services.commands import DEFAULT_REPLY, handle_command, is_command
+from app.services.commands import (
+    DEFAULT_REPLY,
+    handle_command,
+    handle_interactive,
+    handle_language_input,
+    is_command,
+)
 from app.services.rate_limiter import check_and_record
 from app.services.security import verify_signature
+from app.services.user_state import is_waiting_for_language
 from app.services.voice_processing import process_voice_note
 from app.services.whatsapp import send_text_message
 from app.utils import mask_phone
@@ -86,9 +95,7 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks) -
     lightweight: verify + parse + log, then schedule all the real work
     (DB checks, dispatch, the full voice note pipeline, etc.) as a single
     BackgroundTask per message so it runs *after* we've already responded
-    200 below. A future phase may swap BackgroundTasks for a proper task
-    queue if reliability/retries become a concern (BackgroundTasks don't
-    survive a server restart mid-task).
+    200 below.
 
     Signature verification is the one thing that runs *before* returning
     200 — an invalid signature means the request didn't come from Meta at
@@ -119,8 +126,9 @@ async def _handle_message(message_info: dict) -> None:
     """
     Runs as a BackgroundTask, once per incoming message, *after* the
     webhook has already returned 200 to Meta. Applies the user-record /
-    blocklist / dedup checks (Phase 3, Parts 3b/3c), then dispatches to
-    the voice note pipeline, a command handler, or the default reply.
+    blocklist / dedup checks, then dispatches to the voice note pipeline,
+    interactive handler, language-input handler, command handler, or
+    default reply.
 
     Never lets an exception escape — this runs detached from any request
     context, so an unhandled exception here would just vanish into
@@ -130,6 +138,8 @@ async def _handle_message(message_info: dict) -> None:
     wa_message_id = message_info["id"]
     message_type = message_info["type"]
     content = message_info["content"]
+    interactive_id = message_info.get("interactive_id")
+    interactive_title = message_info.get("interactive_title") or ""
 
     logger.info(
         "Incoming WhatsApp message | from=%s | id=%s | type=%s",
@@ -139,7 +149,7 @@ async def _handle_message(message_info: dict) -> None:
     )
 
     try:
-        user, is_new_user = await db_ops.touch_user(sender)
+        user, _is_new_user = await db_ops.touch_user(sender)
 
         if user.is_blocked:
             logger.info("Ignoring message from blocked user %s", mask_phone(sender))
@@ -162,9 +172,13 @@ async def _handle_message(message_info: dict) -> None:
                 media_id=content,
                 sender=sender,
                 wa_message_id=wa_message_id,
-                is_new_user=is_new_user,
-                preferred_language=user.preferred_language,
             )
+        elif message_type == "interactive" and interactive_id:
+            await handle_interactive(sender, interactive_id, interactive_title)
+            await db_ops.update_message_status(wa_message_id, "succeeded")
+        elif message_type == "text" and is_waiting_for_language(sender):
+            await handle_language_input(sender, content)
+            await db_ops.update_message_status(wa_message_id, "succeeded")
         elif message_type == "text" and is_command(content):
             await handle_command(sender, content)
             await db_ops.update_message_status(wa_message_id, "succeeded")
@@ -199,10 +213,15 @@ def _extract_messages(payload: dict) -> list[dict]:
                       {
                         "from": "15551234567",
                         "id": "wamid.XXXX",
-                        "type": "text" | "audio" | "voice" | ...,
-                        "text": {"body": "hello"},                 # if type == "text"
-                        "audio": {"id": "<media_id>", ...},          # if type == "audio"
-                        "voice": {"id": "<media_id>", ...},          # if type == "voice"
+                        "type": "text" | "audio" | "voice" | "interactive" | ...,
+                        "text": {"body": "hello"},
+                        "audio": {"id": "<media_id>", ...},
+                        "voice": {"id": "<media_id>", ...},
+                        "interactive": {
+                          "type": "button_reply" | "list_reply",
+                          "button_reply": {"id": "...", "title": "..."},
+                          "list_reply": {"id": "...", "title": "..."}
+                        },
                         ...
                       }
                     ]
@@ -218,9 +237,8 @@ def _extract_messages(payload: dict) -> list[dict]:
     shape. We simply skip anything that doesn't match, rather than
     treating it as an error.
 
-    Returns a list of dicts: {"from": str, "id": str, "type": str, "content": str}
-    where "content" is either the text body or a media ID (for
-    audio/voice messages), depending on the message type.
+    Returns a list of dicts with keys: from, id, type, content,
+    interactive_id (optional), interactive_title (optional).
     """
     results: list[dict] = []
 
@@ -233,7 +251,7 @@ def _extract_messages(payload: dict) -> list[dict]:
 
             # No "messages" key means this change is something else, e.g.
             # a "statuses" update (sent/delivered/read/failed). Nothing to
-            # extract for Phase 1 — just skip it quietly.
+            # extract — just skip it quietly.
             messages = value.get("messages")
             if not messages:
                 if value.get("statuses"):
@@ -248,14 +266,18 @@ def _extract_messages(payload: dict) -> list[dict]:
 
 def _parse_single_message(message: dict) -> dict:
     """
-    Extract sender, message ID, type, and content/media-id from a single
-    WhatsApp message object, tolerating missing/unexpected fields.
+    Extract sender, message ID, type, and content/media-id / interactive
+    reply from a single WhatsApp message object, tolerating missing/
+    unexpected fields.
     """
     sender = message.get("from", "unknown")
     wa_message_id = message.get("id", "")
     message_type = message.get("type", "unknown")
 
-    content: str
+    content = ""
+    interactive_id: str | None = None
+    interactive_title: str | None = None
+
     if message_type == "text":
         content = message.get("text", {}).get("body", "")
     elif message_type in ("audio", "voice"):
@@ -263,10 +285,29 @@ def _parse_single_message(message: dict) -> dict:
         # only a media ID, which must be fetched separately via the Graph
         # API's media endpoint (see app/services/whatsapp.py).
         content = message.get(message_type, {}).get("id", "")
+    elif message_type == "interactive":
+        interactive = message.get("interactive", {}) or {}
+        interactive_type = interactive.get("type", "")
+        if interactive_type == "button_reply":
+            reply = interactive.get("button_reply", {}) or {}
+        elif interactive_type == "list_reply":
+            reply = interactive.get("list_reply", {}) or {}
+        else:
+            reply = {}
+        interactive_id = reply.get("id") or None
+        interactive_title = reply.get("title") or ""
+        content = interactive_id or ""
     else:
         # Covers other WhatsApp message types (image, video, document,
-        # location, contacts, sticker, interactive/button replies, etc.)
-        # which we don't handle beyond the default nudge reply.
+        # location, contacts, sticker, etc.) which we don't handle beyond
+        # the default nudge reply.
         content = f"<unsupported message type: {message_type}>"
 
-    return {"from": sender, "id": wa_message_id, "type": message_type, "content": content}
+    return {
+        "from": sender,
+        "id": wa_message_id,
+        "type": message_type,
+        "content": content,
+        "interactive_id": interactive_id,
+        "interactive_title": interactive_title,
+    }
