@@ -32,6 +32,7 @@ from app.services.commands import send_post_transcript_actions, slash_command_fa
 from app.services.llm import cleanup_transcript, resolve_effective_language
 from app.services.transcript_cache import set_last_transcript
 from app.services.transcription import convert_to_wav, probe_duration_seconds, transcribe_audio
+from app.services.user_errors import ErrorType, classify_for_voice_pipeline, send_user_error
 from app.services.user_state import clear_waiting_for_language
 from app.services.whatsapp import download_media, get_media_info, send_long_message, send_text_message
 from app.utils import log_voice_note_event, mask_phone
@@ -42,24 +43,6 @@ PROCESSING_MESSAGE = "⏳ Processing your voice note..."
 
 MAX_FILE_SIZE_BYTES = 25 * 1024 * 1024  # 25MB
 MAX_DURATION_SECONDS = 3 * 60  # 3 minutes
-
-_ERROR_MESSAGE = (
-    "⚠️ Something went wrong while processing your voice note.\nPlease try again in a minute."
-)
-
-_EMPTY_TRANSCRIPT_MESSAGE = (
-    "🤔 I couldn't make out any speech in that voice note. Could you try sending it again?"
-)
-
-_FILE_TOO_LARGE_MESSAGE = "⚠️ Voice note is too large (max 25MB).\nPlease send a shorter recording."
-
-_DURATION_TOO_LONG_MESSAGE = (
-    "⚠️ Voice note is too long (max 3 minutes).\nPlease split it into shorter parts."
-)
-
-_DAILY_LIMIT_MESSAGE_TEMPLATE = (
-    "⚠️ You've used all {limit} voice notes for today.\nResets at midnight UTC. See you tomorrow! 🌙"
-)
 
 _LANGUAGE_DISPLAY_LABELS = {
     "urdu": "Urdu",
@@ -96,10 +79,10 @@ async def process_voice_note(
         # user doesn't cost us bandwidth/ffmpeg time. --------------------
         new_count = await db_ops.increment_daily_usage(sender)
         if new_count > settings.daily_voice_limit:
-            await send_text_message(
-                sender, _DAILY_LIMIT_MESSAGE_TEMPLATE.format(limit=settings.daily_voice_limit)
+            await send_user_error(
+                sender, ErrorType.DAILY_LIMIT, limit=settings.daily_voice_limit
             )
-            await db_ops.update_message_status(wa_message_id, "failed")
+            await _safe_update_status(wa_message_id, "failed")
             _log_result(sender, wa_message_id, "failed", None, None, timings, 0, "daily_limit_exceeded", start_time)
             return
 
@@ -109,16 +92,16 @@ async def process_voice_note(
         media_url, reported_file_size = await get_media_info(media_id)
 
         if reported_file_size is not None and reported_file_size > MAX_FILE_SIZE_BYTES:
-            await send_text_message(sender, _FILE_TOO_LARGE_MESSAGE)
-            await db_ops.update_message_status(wa_message_id, "failed")
+            await send_user_error(sender, ErrorType.FILE_TOO_LARGE)
+            await _safe_update_status(wa_message_id, "failed")
             _log_result(sender, wa_message_id, "failed", None, None, timings, 0, "file_too_large", start_time)
             return
 
         audio_bytes = await download_media(media_url)
 
         if len(audio_bytes) > MAX_FILE_SIZE_BYTES:
-            await send_text_message(sender, _FILE_TOO_LARGE_MESSAGE)
-            await db_ops.update_message_status(wa_message_id, "failed")
+            await send_user_error(sender, ErrorType.FILE_TOO_LARGE)
+            await _safe_update_status(wa_message_id, "failed")
             _log_result(sender, wa_message_id, "failed", None, None, timings, 0, "file_too_large", start_time)
             return
 
@@ -130,8 +113,8 @@ async def process_voice_note(
 
             audio_duration_sec = await probe_duration_seconds(input_path)
             if audio_duration_sec > MAX_DURATION_SECONDS:
-                await send_text_message(sender, _DURATION_TOO_LONG_MESSAGE)
-                await db_ops.update_message_status(wa_message_id, "failed")
+                await send_user_error(sender, ErrorType.DURATION_TOO_LONG)
+                await _safe_update_status(wa_message_id, "failed")
                 _log_result(
                     sender, wa_message_id, "failed", None, audio_duration_sec, timings, 0, "duration_too_long", start_time
                 )
@@ -144,8 +127,8 @@ async def process_voice_note(
             timings["transcription_time_sec"] = round(time.monotonic() - transcription_start, 2)
 
         if not raw_transcript.strip():
-            await send_text_message(sender, _EMPTY_TRANSCRIPT_MESSAGE)
-            await db_ops.update_message_status(wa_message_id, "failed")
+            await send_user_error(sender, ErrorType.EMPTY_TRANSCRIPT)
+            await _safe_update_status(wa_message_id, "failed")
             _log_result(
                 sender, wa_message_id, "failed", detected_language, audio_duration_sec, timings, 0, "empty_transcript", start_time
             )
@@ -184,7 +167,7 @@ async def process_voice_note(
             )
             await send_text_message(sender, slash_command_fallback_footer())
 
-        await db_ops.update_message_status(wa_message_id, "succeeded")
+        await _safe_update_status(wa_message_id, "succeeded")
         _log_result(
             sender, wa_message_id, "success", detected_language, audio_duration_sec, timings, transcript_char_count, None, start_time
         )
@@ -193,8 +176,9 @@ async def process_voice_note(
         logger.exception(
             "Voice note processing failed | media_id=%s | sender=%s", media_id, mask_phone(sender)
         )
-        await send_text_message(sender, _ERROR_MESSAGE)
-        await db_ops.update_message_status(wa_message_id, "failed")
+        error_type = classify_for_voice_pipeline(exc)
+        await send_user_error(sender, error_type)
+        await _safe_update_status(wa_message_id, "failed")
         _log_result(
             sender,
             wa_message_id,
@@ -203,8 +187,20 @@ async def process_voice_note(
             audio_duration_sec,
             timings,
             transcript_char_count,
-            type(exc).__name__,
+            error_type.value,
             start_time,
+        )
+
+
+async def _safe_update_status(wa_message_id: str, status: str) -> None:
+    """Best-effort status write — never raises into the pipeline."""
+    try:
+        await db_ops.update_message_status(wa_message_id, status)
+    except Exception:
+        logger.exception(
+            "Failed to update message status | id=%s | status=%s",
+            wa_message_id,
+            status,
         )
 
 

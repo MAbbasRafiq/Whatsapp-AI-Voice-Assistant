@@ -18,6 +18,12 @@ from app.config import settings
 from app.services import db_ops
 from app.services.llm import resolve_effective_language, summarize_transcript, translate_transcript
 from app.services.transcript_cache import get_last_transcript
+from app.services.user_errors import (
+    ErrorType,
+    classify_for_request,
+    classify_for_translate,
+    send_user_error,
+)
 from app.services.user_state import (
     clear_waiting_for_language,
     is_waiting_for_language,
@@ -71,31 +77,14 @@ _LANGUAGE_LIST_ROWS: list[tuple[str, str]] = [
     (LANG_OTHER, "✍️ Other language..."),
 ]
 
+# Kept as a public alias — same wording as ErrorType.NO_TRANSCRIPT.
 NO_TRANSCRIPT_REPLY = (
     "I couldn't find a recent transcript.\n"
     "Remember voice expires after 15 min\n"
     "Send a new voice note."
 )
 
-_GENERIC_ERROR_REPLY = (
-    "⚠️ Something went wrong while processing your request. Please try again in a minute."
-)
-
-_UNSUPPORTED_LANGUAGE_REPLY = (
-    "⚠️ I couldn't translate into that language. "
-    "Please try a common language name (e.g. Spanish, German, Turkish)."
-)
-
-_EMPTY_LANGUAGE_REPLY = (
-    "🌍 Type the language you'd like to translate into."
-)
-
 _ASK_OTHER_LANGUAGE = "🌍 Type the language you'd like to translate into."
-
-_WAITING_EXPIRED_REPLY = (
-    "⏳ That language request expired. "
-    "Send a voice note or tap Translate again."
-)
 
 DEFAULT_REPLY = (
     "🎤 Send me a voice note and I'll convert it to clean text!\n\n"
@@ -179,13 +168,13 @@ async def handle_command(wa_phone: str, text: str) -> None:
             await send_text_message(wa_phone, help_text)
         else:
             await send_text_message(wa_phone, DEFAULT_REPLY)
-    except Exception:
+    except Exception as exc:
         logger.exception(
             "Command handling failed | wa_phone=%s | command=%s",
             mask_phone(wa_phone),
             command,
         )
-        await send_text_message(wa_phone, _GENERIC_ERROR_REPLY)
+        await send_user_error(wa_phone, classify_for_request(exc))
 
 
 async def handle_interactive(wa_phone: str, reply_id: str, reply_title: str = "") -> None:
@@ -213,14 +202,14 @@ async def handle_interactive(wa_phone: str, reply_id: str, reply_title: str = ""
                 reply_title,
                 mask_phone(wa_phone),
             )
-            await send_text_message(wa_phone, DEFAULT_REPLY)
-    except Exception:
+            await send_user_error(wa_phone, ErrorType.UNEXPECTED_INTERACTIVE)
+    except Exception as exc:
         logger.exception(
             "Interactive handling failed | wa_phone=%s | reply_id=%s",
             mask_phone(wa_phone),
             reply_id,
         )
-        await send_text_message(wa_phone, _GENERIC_ERROR_REPLY)
+        await send_user_error(wa_phone, classify_for_request(exc))
 
 
 async def handle_language_input(wa_phone: str, language_text: str) -> None:
@@ -232,14 +221,14 @@ async def handle_language_input(wa_phone: str, language_text: str) -> None:
     tells them to start Translate again.
     """
     if not is_waiting_for_language(wa_phone):
-        await send_text_message(wa_phone, _WAITING_EXPIRED_REPLY)
+        await send_user_error(wa_phone, ErrorType.WAITING_EXPIRED)
         return
 
     clear_waiting_for_language(wa_phone)
 
     language = language_text.strip()
     if not language:
-        await send_text_message(wa_phone, _EMPTY_LANGUAGE_REPLY)
+        await send_user_error(wa_phone, ErrorType.EMPTY_LANGUAGE)
         set_waiting_for_language(wa_phone)
         return
 
@@ -248,25 +237,25 @@ async def handle_language_input(wa_phone: str, language_text: str) -> None:
     if language.startswith("/"):
         language = language.lstrip("/").strip()
         if not language:
-            await send_text_message(wa_phone, _EMPTY_LANGUAGE_REPLY)
+            await send_user_error(wa_phone, ErrorType.EMPTY_LANGUAGE)
             set_waiting_for_language(wa_phone)
             return
 
     try:
         await _translate_last(wa_phone, language)
-    except Exception:
+    except Exception as exc:
         logger.exception(
             "Language-input translation failed | wa_phone=%s | language=%r",
             mask_phone(wa_phone),
             language,
         )
-        await send_text_message(wa_phone, _GENERIC_ERROR_REPLY)
+        await send_user_error(wa_phone, classify_for_request(exc))
 
 
 async def _start_translate_flow(wa_phone: str) -> None:
     """Show the language list, or fall back to slash-style English translate."""
     if get_last_transcript(wa_phone) is None:
-        await send_text_message(wa_phone, NO_TRANSCRIPT_REPLY)
+        await send_user_error(wa_phone, ErrorType.NO_TRANSCRIPT)
         return
 
     sent = await send_list_message(
@@ -295,7 +284,7 @@ async def _start_translate_flow(wa_phone: str) -> None:
 async def _prompt_other_language(wa_phone: str) -> None:
     if get_last_transcript(wa_phone) is None:
         clear_waiting_for_language(wa_phone)
-        await send_text_message(wa_phone, NO_TRANSCRIPT_REPLY)
+        await send_user_error(wa_phone, ErrorType.NO_TRANSCRIPT)
         return
 
     set_waiting_for_language(wa_phone)
@@ -306,24 +295,24 @@ async def _translate_last(wa_phone: str, target_language: str) -> None:
     cached = get_last_transcript(wa_phone)
     if cached is None:
         clear_waiting_for_language(wa_phone)
-        await send_text_message(wa_phone, NO_TRANSCRIPT_REPLY)
+        await send_user_error(wa_phone, ErrorType.NO_TRANSCRIPT)
         return
 
     text, language = cached
     try:
         translated = await translate_transcript(text, language, target_language=target_language)
-    except Exception:
+    except Exception as exc:
         logger.exception(
             "translate_transcript failed | wa_phone=%s | target=%r",
             mask_phone(wa_phone),
             target_language,
         )
-        await send_text_message(wa_phone, _UNSUPPORTED_LANGUAGE_REPLY)
+        await send_user_error(wa_phone, classify_for_translate(exc))
         clear_waiting_for_language(wa_phone)
         return
 
     if not translated.strip():
-        await send_text_message(wa_phone, _UNSUPPORTED_LANGUAGE_REPLY)
+        await send_user_error(wa_phone, ErrorType.UNSUPPORTED_LANGUAGE)
         clear_waiting_for_language(wa_phone)
         return
 
@@ -334,13 +323,30 @@ async def _translate_last(wa_phone: str, target_language: str) -> None:
 async def _summarize_last(wa_phone: str) -> None:
     cached = get_last_transcript(wa_phone)
     if cached is None:
-        await send_text_message(wa_phone, NO_TRANSCRIPT_REPLY)
+        await send_user_error(wa_phone, ErrorType.NO_TRANSCRIPT)
         return
 
     text, language = cached
     preferred_language = await db_ops.get_preferred_language(wa_phone)
     target_language = preferred_language or resolve_effective_language(language)
-    summary = await summarize_transcript(text, target_language)
+    try:
+        summary = await summarize_transcript(text, target_language)
+    except Exception as exc:
+        # Classify here so Groq/infra failures get a specific reply instead
+        # of only the outer generic request-failed message. The outer
+        # try/except in handle_command / handle_interactive remains as a
+        # safety net for anything else in this function.
+        logger.exception(
+            "summarize_transcript failed | wa_phone=%s",
+            mask_phone(wa_phone),
+        )
+        await send_user_error(wa_phone, classify_for_request(exc))
+        return
+
+    if not summary.strip():
+        await send_user_error(wa_phone, ErrorType.REQUEST_FAILED)
+        return
+
     await send_long_message(wa_phone, summary)
 
 

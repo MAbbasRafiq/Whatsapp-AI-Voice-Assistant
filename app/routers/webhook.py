@@ -43,14 +43,13 @@ from app.services.commands import (
 )
 from app.services.rate_limiter import check_and_record
 from app.services.security import verify_signature
+from app.services.user_errors import ErrorType, classify_exception, send_user_error
 from app.services.user_state import is_waiting_for_language
 from app.services.voice_processing import process_voice_note
 from app.services.whatsapp import send_text_message
 from app.utils import mask_phone
 
 logger = logging.getLogger(__name__)
-
-_RATE_LIMITED_REPLY = "⏳ Please wait a few seconds before sending another voice note."
 
 router = APIRouter(tags=["webhook"])
 
@@ -163,11 +162,11 @@ async def _handle_message(message_info: dict) -> None:
 
         if message_type in ("audio", "voice"):
             if not check_and_record(sender):
-                await send_text_message(sender, _RATE_LIMITED_REPLY)
-                await db_ops.update_message_status(wa_message_id, "rate_limited")
+                await send_user_error(sender, ErrorType.RATE_LIMITED)
+                await _safe_update_message_status(wa_message_id, "rate_limited")
                 return
 
-            await db_ops.update_message_status(wa_message_id, "queued")
+            await _safe_update_message_status(wa_message_id, "queued")
             await process_voice_note(
                 media_id=content,
                 sender=sender,
@@ -175,24 +174,62 @@ async def _handle_message(message_info: dict) -> None:
             )
         elif message_type == "interactive" and interactive_id:
             await handle_interactive(sender, interactive_id, interactive_title)
-            await db_ops.update_message_status(wa_message_id, "succeeded")
+            await _safe_update_message_status(wa_message_id, "succeeded")
+        elif message_type == "interactive":
+            # Interactive payload present but missing/empty reply id —
+            # previously fell through to the generic nudge; keep that UX
+            # via the centralized unexpected-interactive message (same text).
+            logger.warning(
+                "Interactive message with no reply id | from=%s | id=%s",
+                mask_phone(sender),
+                wa_message_id,
+            )
+            await send_user_error(sender, ErrorType.UNEXPECTED_INTERACTIVE)
+            await _safe_update_message_status(wa_message_id, "succeeded")
         elif message_type == "text" and is_waiting_for_language(sender):
             await handle_language_input(sender, content)
-            await db_ops.update_message_status(wa_message_id, "succeeded")
+            await _safe_update_message_status(wa_message_id, "succeeded")
         elif message_type == "text" and is_command(content):
             await handle_command(sender, content)
-            await db_ops.update_message_status(wa_message_id, "succeeded")
+            await _safe_update_message_status(wa_message_id, "succeeded")
         else:
             # Anything else (plain text, image, sticker, location, etc.)
             # gets a friendly nudge toward the bot's actual purpose.
             await send_text_message(sender, DEFAULT_REPLY)
-            await db_ops.update_message_status(wa_message_id, "succeeded")
+            await _safe_update_message_status(wa_message_id, "succeeded")
 
-    except Exception:
+    except Exception as exc:
         logger.exception(
             "Unhandled error while processing message | from=%s | id=%s",
             mask_phone(sender),
             wa_message_id,
+        )
+        # Previously this path logged only — the user got no WhatsApp reply.
+        # Notify with a classified friendly message; if sending also fails,
+        # log and move on (can't reach the user if Graph itself is down).
+        try:
+            await send_user_error(sender, classify_exception(exc))
+        except Exception:
+            logger.exception(
+                "Failed to send error reply after unhandled error | from=%s",
+                mask_phone(sender),
+            )
+        await _safe_update_message_status(wa_message_id, "failed")
+
+
+async def _safe_update_message_status(wa_message_id: str, status: str) -> None:
+    """
+    Best-effort status write. Failures are logged but never raised so a
+    DB blip after the user already got a reply cannot trigger a second
+    (misleading) error message from the outer handler.
+    """
+    try:
+        await db_ops.update_message_status(wa_message_id, status)
+    except Exception:
+        logger.exception(
+            "Failed to update message status | id=%s | status=%s",
+            wa_message_id,
+            status,
         )
 
 
