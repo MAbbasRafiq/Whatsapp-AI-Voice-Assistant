@@ -473,9 +473,9 @@ Rules:
 async def summarize_transcript(cleaned_text: str, target_language: str) -> str:
     """
     Re-run the LLM on an already-cleaned transcript to produce a concise
-    bullet-point summary, in `target_language` (the user's preferred
-    language if set, otherwise the transcript's own detected language).
-    Used by the `/summarize` command.
+    bullet-point summary in `target_language` (the transcript's own
+    language/script — callers should pass the cached detected language,
+    not a translation preference). Used by Summarize / `/summarize`.
     """
     if not cleaned_text.strip():
         return ""

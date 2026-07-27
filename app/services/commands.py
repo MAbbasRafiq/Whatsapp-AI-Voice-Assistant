@@ -327,8 +327,10 @@ async def _summarize_last(wa_phone: str) -> None:
         return
 
     text, language = cached
-    preferred_language = await db_ops.get_preferred_language(wa_phone)
-    target_language = preferred_language or resolve_effective_language(language)
+    # Always summarize in the transcript's own language — never auto-translate
+    # via preferred_language. Translation only happens when the user taps
+    # Translate (or uses /translate).
+    target_language = resolve_effective_language(language)
     try:
         summary = await summarize_transcript(text, target_language)
     except Exception as exc:
@@ -348,6 +350,16 @@ async def _summarize_last(wa_phone: str) -> None:
         return
 
     await send_long_message(wa_phone, summary)
+
+    # Re-offer the same post-transcript Reply Buttons so the user can keep
+    # interacting (Translate / Summarize again / Help) without resending.
+    buttons_sent = await send_post_transcript_actions(wa_phone)
+    if not buttons_sent:
+        logger.warning(
+            "Reply buttons failed after summarize; sending slash-command fallback | wa_phone=%s",
+            mask_phone(wa_phone),
+        )
+        await send_text_message(wa_phone, slash_command_fallback_footer())
 
 
 async def _handle_set_preference(wa_phone: str, language: str) -> None:
