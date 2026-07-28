@@ -1,11 +1,10 @@
 """
 LLM-based transcript cleanup.
 
-Raw Whisper transcripts tend to contain filler words ("um", "uh", "like",
-"you know"), run-on sentences with little/no punctuation, and no paragraph
-structure. This module sends the raw transcript to a Groq-hosted LLM to
-clean that up into readable text — without changing the meaning, tone, or
-language of what was actually said.
+Raw Whisper transcripts tend to contain filler words ("um", "uh", "hm",
+"you know"). This module sends the raw transcript to a Groq-hosted LLM
+to strip those fillers and add basic punctuation — without paraphrasing,
+summarizing, or changing the speaker's words.
 """
 
 import logging
@@ -180,18 +179,28 @@ def _build_cleanup_system_prompt(detected_language: str, target_language: str | 
     )
 
     return f"""\
-You clean up raw voice-to-text transcripts for a WhatsApp voice notes app.
+You clean raw voice-to-text transcripts for a WhatsApp voice notes app.
 
-You are a transcript FORMATTER, not a summarizer. Your only job is to
-take the raw spoken-word transcript and lightly polish it — you are NOT
-writing a summary, a gist, or a shorter version of what was said.
+You are a transcript CLEANER, not an editor, rewriter, or summarizer.
+Your only job is to remove pure filler sounds/words and add basic
+punctuation — you must keep the speaker's original wording.
 
 Detected spoken language: {effective_source_language}
 
 Rules:
-- Remove filler words and verbal stumbles (um, uh, like, you know, etc.).
-- Fix punctuation and capitalization, and break the text into clear
-  paragraphs where natural pauses or topic changes occur.
+- REMOVE ONLY pure fillers / hesitation sounds, for example:
+  um, uh, hmm, hm, er, ah, "you know", and "like" / "so" only when they
+  are empty fillers (not when they carry meaning, e.g. "like two weeks"
+  meaning approximately two weeks).
+- Do NOT remove repeated words or false starts. Messy spoken grammar is
+  fine to keep (e.g. keep "I was going I was going to the store" as-is —
+  do not collapse it to "I was going to the store").
+- Do NOT paraphrase, synonym-swap, reorder clauses, "improve" grammar,
+  or polish wording. If the speaker said a word, keep that word (unless
+  it is a pure filler listed above).
+- You MAY add punctuation, capitalization, and paragraph breaks where
+  natural pauses or topic changes occur — that is formatting only, not
+  rewriting.
 - Preserve the original meaning and tone exactly as spoken.
 - {language_rule}
 - If the speech mixes languages (e.g. Urdu and English in the same
@@ -217,22 +226,18 @@ Rules:
   as if the speaker had said that word in Urdu to begin with. Devanagari
   must always be fully converted, never preserved and never left mixed
   in — the final output must have zero Devanagari characters.
-- CRITICAL — DO NOT SUMMARIZE: the cleaned-up text must preserve every
-  idea, sentence, and detail from the original speech, and must be
-  roughly the same length as the raw transcript (only shorter by the
-  filler words you removed). Turning multiple sentences into a single
-  short summary sentence is WRONG, even if that sentence captures the
-  "gist" — you must keep every distinct point that was made.
+- CRITICAL — DO NOT SUMMARIZE OR REWRITE: keep every idea, sentence, and
+  detail, in the speaker's own words. The cleaned text must be nearly
+  the same length as the raw transcript (shorter only by the fillers you
+  removed). Turning content into a smoother or shorter version is WRONG.
 - Do not add information that wasn't said.
 - Reply with ONLY the cleaned-up text. No preamble, no explanations, no
   wrapping quotation marks.
 """
 
 
-# A concrete before/after example, given to the model as an actual
-# conversation turn (not just described in the system prompt). Few-shot
-# examples like this anchor behavior far more reliably than instructions
-# alone — this is what stopped the model from summarizing in testing.
+# Few-shot: remove only fillers (um/uh/like/you know); keep stutters like
+# "the, the" and meaning-bearing "like" ("like two weeks").
 _EXAMPLE_RAW_TRANSCRIPT = (
     "Um, so like, I wanted to talk to you about the, the project timeline. "
     "Uh, I think we need to, you know, push the deadline back by like two "
@@ -241,9 +246,9 @@ _EXAMPLE_RAW_TRANSCRIPT = (
 )
 
 _EXAMPLE_CLEANED_TRANSCRIPT = (
-    "I wanted to talk to you about the project timeline. I think we need "
-    "to push the deadline back by two weeks because the client hasn't "
-    "given us the assets yet.\n\n"
+    "I wanted to talk to you about the, the project timeline. I think we "
+    "need to push the deadline back by like two weeks because the client "
+    "hasn't given us the assets yet.\n\n"
     "Also, the design team is still waiting on feedback from marketing."
 )
 
@@ -271,10 +276,10 @@ async def cleanup_transcript(
 ) -> str:
     """
     Send a raw transcript to a Groq-hosted LLM (llama-3.3-70b-versatile)
-    for cleanup: removes filler words, fixes punctuation/paragraphs, and
-    keeps the original meaning and full content intact (no summarizing —
-    see `_build_cleanup_system_prompt` and the few-shot example below for
-    how that's enforced).
+    for minimal cleanup: remove pure fillers (um/uh/hm/etc.), add
+    punctuation/paragraphs, and keep the speaker's original wording —
+    including repetitions and messy spoken grammar. See
+    `_build_cleanup_system_prompt` and the few-shot examples below.
 
     Args:
         raw_transcript: The raw Whisper transcript text.
@@ -304,10 +309,8 @@ async def cleanup_transcript(
 
     messages: list[dict[str, str]] = [
         {"role": "system", "content": system_prompt},
-        # Few-shot examples (as real conversation turns, not just described
-        # in the prompt) — anchors two behaviors the model otherwise gets
-        # wrong: (1) not summarizing, (2) converting stray Devanagari words
-        # to their natural Urdu equivalent rather than leaving them as-is.
+        # Few-shot examples — anchors: (1) strip fillers only, keep stutters /
+        # wording, (2) convert stray Devanagari to natural Urdu equivalents.
         {"role": "user", "content": _EXAMPLE_RAW_TRANSCRIPT},
         {"role": "assistant", "content": _EXAMPLE_CLEANED_TRANSCRIPT},
         {"role": "user", "content": _EXAMPLE_MIXED_SCRIPT_RAW},
