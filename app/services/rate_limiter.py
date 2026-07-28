@@ -2,8 +2,9 @@
 Simple in-memory rate limiter for voice note processing and TTS.
 
 Limits each phone number to 1 voice note every `RATE_LIMIT_WINDOW_SECONDS`
-seconds, and separately gates TTS (/voice + Listen) with a cooldown plus
-an in-flight busy lock so double-taps cannot run two synthesizers at once.
+seconds, with an in-flight busy lock so a second note cannot start while
+Whisper/LLM is still running (the cooldown alone is not enough — pipelines
+often take longer than 10s). TTS (/voice + Listen) has the same pattern.
 
 This is intentionally a plain in-process dict, not backed by Redis/DB —
 it resets on every restart and doesn't work across multiple app
@@ -23,29 +24,37 @@ TTS_RATE_LIMIT_WINDOW_SECONDS = 10.0
 _last_voice_note_at: dict[str, float] = {}
 # wa_phone -> monotonic timestamp of the last *finished* TTS attempt.
 _last_tts_at: dict[str, float] = {}
-# Phones currently inside the TTS pipeline (synthesize → upload → send).
+# Phones currently inside the voice / TTS pipelines.
+_voice_in_progress: set[str] = set()
 _tts_in_progress: set[str] = set()
 _lock = Lock()
 
 
-def check_and_record(wa_phone: str) -> bool:
+def try_acquire_voice(wa_phone: str) -> str:
     """
-    Check whether `wa_phone` is allowed to send a voice note right now,
-    and if so, record this attempt as the new "last accepted" timestamp.
+    Gate a voice-note request for `wa_phone`.
 
     Returns:
-        True if allowed (and the timestamp was recorded).
-        False if the phone is still within the rate-limit window (the
-        existing timestamp is left untouched, so the window doesn't keep
-        sliding forward on repeated rejected attempts).
+        "ok" — caller must call `release_voice` when finished.
+        "busy" — another voice note is already being processed for this phone.
+        "rate_limited" — still inside the post-accept cooldown window.
     """
     now = time.monotonic()
     with _lock:
+        if wa_phone in _voice_in_progress:
+            return "busy"
         last_at = _last_voice_note_at.get(wa_phone)
         if last_at is not None and (now - last_at) < RATE_LIMIT_WINDOW_SECONDS:
-            return False
+            return "rate_limited"
+        _voice_in_progress.add(wa_phone)
         _last_voice_note_at[wa_phone] = now
-        return True
+        return "ok"
+
+
+def release_voice(wa_phone: str) -> None:
+    """Clear the in-flight voice-note flag for `wa_phone`."""
+    with _lock:
+        _voice_in_progress.discard(wa_phone)
 
 
 def try_acquire_tts(wa_phone: str) -> str:

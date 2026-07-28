@@ -57,3 +57,22 @@ def is_waiting_for_language(wa_phone: str) -> bool:
             del _states[wa_phone]
             return False
         return True
+
+
+def consume_waiting_for_language(wa_phone: str) -> bool:
+    """
+    Atomically claim-and-clear a pending "type a language" prompt.
+
+    Returns True only for the first caller; concurrent messages that both
+    saw waiting=True cannot both proceed to translate (avoids double LLM
+    / double WhatsApp replies from overlapping deliveries).
+    """
+    with _lock:
+        entry = _states.get(wa_phone)
+        if entry is None or not entry.waiting_for_language:
+            return False
+        if time.monotonic() - entry.updated_at > STATE_TTL_SECONDS:
+            del _states[wa_phone]
+            return False
+        del _states[wa_phone]
+        return True

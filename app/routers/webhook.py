@@ -25,7 +25,8 @@ incoming message:
     5. Dispatch: voice/audio -> rate limit -> full processing pipeline;
        interactive button/list replies -> interactive handler;
        plain text while waiting_for_language -> language input handler;
-       "/command" text -> command handler; anything else -> default nudge.
+       eligible plain text -> Convert to Voice offer; `/voice` (compat)
+       -> TTS; anything else -> default nudge.
 """
 
 import logging
@@ -39,12 +40,13 @@ from app.services.commands import (
     handle_command,
     handle_interactive,
     handle_language_input,
+    handle_plain_text,
     is_command,
 )
-from app.services.rate_limiter import check_and_record
+from app.services.rate_limiter import release_voice, try_acquire_voice
 from app.services.security import verify_signature
 from app.services.user_errors import ErrorType, classify_exception, send_user_error
-from app.services.user_state import is_waiting_for_language
+from app.services.user_state import clear_waiting_for_language, is_waiting_for_language
 from app.services.voice_processing import process_voice_note
 from app.services.whatsapp import send_text_message
 from app.utils import mask_phone
@@ -52,6 +54,8 @@ from app.utils import mask_phone
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["webhook"])
+
+_VOICE_BUSY_REPLY = "⏳ Still processing your previous voice note. Please wait a moment."
 
 
 @router.get("/webhook")
@@ -148,6 +152,14 @@ async def _handle_message(message_info: dict) -> None:
     )
 
     try:
+        if not wa_message_id:
+            logger.warning(
+                "Skipping message with empty wa_message_id | from=%s | type=%s",
+                mask_phone(sender),
+                message_type,
+            )
+            return
+
         user, _is_new_user = await db_ops.touch_user(sender)
 
         if user.is_blocked:
@@ -161,17 +173,25 @@ async def _handle_message(message_info: dict) -> None:
             return
 
         if message_type in ("audio", "voice"):
-            if not check_and_record(sender):
+            gate = try_acquire_voice(sender)
+            if gate == "busy":
+                await send_text_message(sender, _VOICE_BUSY_REPLY)
+                await _safe_update_message_status(wa_message_id, "rate_limited")
+                return
+            if gate == "rate_limited":
                 await send_user_error(sender, ErrorType.RATE_LIMITED)
                 await _safe_update_message_status(wa_message_id, "rate_limited")
                 return
 
-            await _safe_update_message_status(wa_message_id, "queued")
-            await process_voice_note(
-                media_id=content,
-                sender=sender,
-                wa_message_id=wa_message_id,
-            )
+            try:
+                await _safe_update_message_status(wa_message_id, "queued")
+                await process_voice_note(
+                    media_id=content,
+                    sender=sender,
+                    wa_message_id=wa_message_id,
+                )
+            finally:
+                release_voice(sender)
         elif message_type == "interactive" and interactive_id:
             await handle_interactive(sender, interactive_id, interactive_title)
             await _safe_update_message_status(wa_message_id, "succeeded")
@@ -186,15 +206,28 @@ async def _handle_message(message_info: dict) -> None:
             )
             await send_user_error(sender, ErrorType.UNEXPECTED_INTERACTIVE)
             await _safe_update_message_status(wa_message_id, "succeeded")
+        elif message_type == "text" and is_command(content):
+            # /voice kept for backward compatibility — not advertised in UX.
+            clear_waiting_for_language(sender)
+            await handle_command(sender, content)
+            await _safe_update_message_status(wa_message_id, "succeeded")
         elif message_type == "text" and is_waiting_for_language(sender):
             await handle_language_input(sender, content)
             await _safe_update_message_status(wa_message_id, "succeeded")
-        elif message_type == "text" and is_command(content):
-            await handle_command(sender, content)
-            await _safe_update_message_status(wa_message_id, "succeeded")
+        elif message_type == "text":
+            sent = await handle_plain_text(sender, content)
+            if not sent:
+                logger.error(
+                    "Failed to handle plain text | from=%s | id=%s",
+                    mask_phone(sender),
+                    wa_message_id,
+                )
+                await _safe_update_message_status(wa_message_id, "failed")
+            else:
+                await _safe_update_message_status(wa_message_id, "succeeded")
         else:
-            # Anything else (plain text, image, sticker, location, etc.)
-            # gets a friendly nudge toward the bot's actual purpose.
+            # Anything else (image, sticker, location, etc.) gets a friendly
+            # nudge toward the bot's actual purpose.
             sent = await send_text_message(sender, DEFAULT_REPLY)
             if not sent:
                 logger.error(

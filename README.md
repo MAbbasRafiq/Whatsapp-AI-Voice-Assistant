@@ -1,7 +1,7 @@
 # VoiceNotes — WhatsApp Bot
 
 VoiceNotes is a WhatsApp bot built with FastAPI that turns voice notes into
-clean, well-formatted text.
+clean, well-formatted text — and plain text into speech via Reply Buttons.
 
 - **Phase 1**: project skeleton + a working webhook that verifies itself
   with Meta, receives incoming WhatsApp messages, and sends plain text
@@ -11,13 +11,13 @@ clean, well-formatted text.
   the transcript with a Groq LLM, and reply with the result.
 - **Phase 3** (current): production hardening — PostgreSQL persistence,
   webhook signature verification, deduplication, a blocklist, rate/daily
-  usage limits, audio pre-checks, per-user language preferences, slash
-  commands, long-message chunking, structured analytics logging, and
-  Railway deployment config.
+  usage limits, audio pre-checks, button-based Translate / Summarize /
+  Help / Text-to-Voice, long-message chunking, structured analytics
+  logging, and Railway deployment config.
 
 ## How it works
 
-1. User sends a voice note (or a text message/command) on WhatsApp.
+1. User sends a voice note or text on WhatsApp.
 2. Meta POSTs the message to `/webhook`. The handler:
    a. Verifies the `X-Hub-Signature-256` HMAC header against `APP_SECRET`
       — requests that don't verify get a `403` and are never processed.
@@ -29,65 +29,65 @@ clean, well-formatted text.
    c. Inserts into `messages` for dedup — if `wa_message_id` already
       exists (a Meta webhook retry), skips silently with no reply.
    d. Dispatches:
-      - **Voice/audio** → rate limit (1 per 10s) → the full pipeline in
-        `app/services/voice_processing.py` (daily quota check → download
-        → file size / duration pre-checks → ffmpeg → Groq Whisper → Groq
-        LLM cleanup, honoring any saved language preference → save
-        transcript → chunked reply → structured analytics log line).
-      - **`/command` text** → `app/services/commands.py`.
-      - **Anything else** → a friendly nudge reply.
+      - **Voice/audio** → per-phone rate limit + in-flight lock → the full
+        pipeline in `app/services/voice_processing.py` (daily quota
+        reserve → download → file size / duration pre-checks → ffmpeg →
+        Groq Whisper → Groq LLM cleanup **in the spoken language** →
+        save transcript → chunked reply → Reply Buttons → analytics log).
+      - **Interactive buttons / lists** → Translate, Summarize, Help,
+        language picker, Listen, or Convert to Voice.
+      - **Plain text (≥ 5 meaningful characters)** → cache text (15 min)
+        → offer **🔊 Convert to Voice**.
+      - **Short / other messages** → friendly guidance nudge.
 4. If any step fails, the user gets one of the specific friendly error
-   messages below (never a raw/internal error), and the full exception
-   is logged server-side.
+   messages (never a raw/internal error), and the full exception is
+   logged server-side.
 
-### Slash commands
+### Button-based UX
 
-| Command      | Effect                                                                 |
-|--------------|-------------------------------------------------------------------------|
-| `/translate` | Re-runs the LLM (not Whisper) on your last transcript, in English      |
-| `/summarize` | Re-runs the LLM on your last transcript as concise bullet points        |
-| `/urdu`      | Saves your language preference — future transcripts reply in Urdu (اردو) |
-| `/english`   | Saves your language preference — future transcripts reply in English   |
-| `/roman`     | Saves your language preference — future transcripts reply in Roman Urdu |
-| `/help`      | Shows the command list                                                 |
+All primary actions use WhatsApp Reply Buttons / List Messages:
 
-`/translate` and `/summarize` operate on an in-memory "last transcript"
-cache (10-minute expiry, one slot per phone number, overwritten by each
-new voice note) — they never re-run Whisper, only the cheaper LLM step.
+| Action | When |
+|--------|------|
+| **🌍 Translate** | After a transcript — opens a language list (English, Urdu, Roman Urdu, Arabic, French, Chinese, or Other…) |
+| **📝 Summarize** | After a transcript — bullet-point summary in the transcript's own language |
+| **❓ Help** | After a transcript — short how-to |
+| **Listen** | After a translation or summary — speaks that result aloud |
+| **🔊 Convert to Voice** | After the user sends plain text (≥ 5 letters/numbers) |
 
-> **Design note on `/roman`:** the original Phase 3 spec listed `/roman`
-> with two conflicting meanings (a one-off "convert last transcript"
-> action, and a persistent preference-setter, like `/urdu`/`/english`).
-> Per your choice, `/roman` here is a **preference-setter only** — it
-> does not re-render your last transcript. If you'd also like a one-off
-> "convert to Roman Urdu right now" action, that would need a new command
-> name (e.g. `/torroman`) since `/roman` is already taken by the
-> preference-setter.
+Transcripts are always cleaned up in the **original spoken language**.
+Users translate themselves by tapping Translate and picking a language —
+there is no saved language preference.
 
-### First-time experience & footers
+Translate / Summarize / Listen operate on in-memory caches (15-minute
+TTL, one slot per phone number). They never re-run Whisper.
 
-- **Brand-new user** (first message ever): after their first transcript,
-  the bot appends an onboarding block explaining `/urdu`, `/english`,
-  `/roman` so they can set a permanent preference — without blocking
-  anything, they get their transcript immediately either way.
-- **Every other successful transcript** (returning users, regardless of
-  whether they've set a preference): a minimal footer is appended
-  instead — `──────────────` + `💡 /translate • /summarize • /roman • /help`.
-- If `users.preferred_language` is set and differs from what was actually
-  spoken, the LLM cleanup step targets that language/script directly
-  (one LLM call, not a cleanup-then-translate round trip).
+> **Note:** `/voice <text>` still works for backward compatibility but is
+> **not advertised** in help or nudges. Prefer sending text and tapping
+> Convert to Voice.
 
 ### Limits & pre-checks
 
-- **Rate limit**: 1 voice note per phone number per 10 seconds (in-memory,
-  resets on restart).
-- **Daily quota**: `DAILY_VOICE_LIMIT` voice notes per user per UTC day
-  (default 20), tracked in `usage_daily`, atomic upsert via
-  `INSERT ... ON CONFLICT ... DO UPDATE`.
-- **File size**: rejected if over 25MB (checked via Meta's media metadata
-  before downloading, and again on the downloaded bytes as a fallback).
+- **Voice rate limit**: 1 accepted voice note per phone per 10 seconds,
+  plus an in-flight lock so a second note cannot start while the first
+  is still processing (in-memory, resets on restart, single process).
+- **TTS rate limit**: same pattern for Convert to Voice / Listen /
+  `/voice` (busy lock + cooldown).
+- **Daily quota**: `DAILY_VOICE_LIMIT` successful voice notes per user
+  per UTC day (default 20). A slot is reserved up front and **refunded**
+  if the pipeline fails before a usable transcript is saved. Tracked in
+  `usage_daily` via conditional `INSERT ... ON CONFLICT ... DO UPDATE`.
+- **File size**: rejected if over 25MB (Meta media metadata, then
+  downloaded bytes as a fallback).
 - **Duration**: rejected if over 3 minutes, probed via `ffmpeg` (parsing
   its stderr `Duration:` line — `imageio-ffmpeg` doesn't bundle `ffprobe`).
+
+### Deployment constraint
+
+In-memory caches (transcript, TTS Listen, pending text-to-voice, rate
+limits, waiting-for-language) are **process-local**. Keep a **single**
+uvicorn worker / Railway replica. Scaling to multiple instances requires
+a shared store (e.g. Redis) first.
 
 ## Project structure
 
@@ -102,16 +102,21 @@ voicenotes/
 │   ├── routers/
 │   │   └── webhook.py             # GET/POST /webhook — sig verification, dedup, blocklist, dispatch
 │   └── services/
-│       ├── whatsapp.py            # send_text_message(), send_long_message() (chunking), media download
+│       ├── whatsapp.py            # text / buttons / lists / media upload-download / chunking
 │       ├── security.py            # X-Hub-Signature-256 HMAC verification
-│       ├── rate_limiter.py        # in-memory 1-voice-note-per-10s limiter
-│       ├── db_ops.py              # all async DB reads/writes (users, messages, usage_daily, transcripts)
-│       ├── transcript_cache.py    # in-memory "last transcript" cache (10 min) for /translate, /summarize
-│       ├── commands.py            # /translate /summarize /urdu /english /roman /help
-│       ├── transcription.py       # ffmpeg conversion, duration probe, Groq Whisper transcription
-│       ├── llm.py                 # Groq LLM cleanup/translate/summarize prompts
+│       ├── rate_limiter.py        # voice + TTS cooldowns and in-flight locks
+│       ├── db_ops.py              # async DB reads/writes (users, messages, usage, transcripts)
+│       ├── transcript_cache.py    # last transcript (15 min) for Translate / Summarize
+│       ├── tts_cache.py           # last summary/translation (15 min) for Listen
+│       ├── text_to_voice_cache.py # pending plain text (15 min) for Convert to Voice
+│       ├── user_state.py          # waiting_for_language after "Other language..."
+│       ├── commands.py            # interactive handlers + plain-text /voice compat
+│       ├── transcription.py       # ffmpeg conversion, duration probe, Groq Whisper
+│       ├── llm.py                 # Groq LLM cleanup / translate / summarize
+│       ├── tts.py                 # Edge TTS synthesis
 │       ├── voice_processing.py    # orchestrates the full voice-note pipeline
-│       └── voice_storage.py       # fire-and-forget Supabase Storage archival of raw voice notes
+│       ├── user_errors.py         # classified friendly WhatsApp error replies
+│       └── voice_storage.py       # fire-and-forget Supabase Storage archival
 ├── migrations/                    # Alembic migration scripts (async)
 ├── alembic.ini
 ├── Procfile                       # Railway/Heroku-style process declaration
@@ -291,15 +296,20 @@ all, even if the callback URL itself verified successfully.
 
 ## 6. Try it out
 
-Send a **voice note** to your WhatsApp test number. You should:
-1. Get an immediate "⏳ Processing your voice note..." reply.
-2. A few seconds later, get the cleaned-up transcript back, with a
-   language header and (first time) an onboarding footer or (afterward) the
-   minimal command footer.
+**Voice note → transcript**
+1. Send a voice note to your WhatsApp test number.
+2. Get an immediate "⏳ Processing your voice note..." reply.
+3. A few seconds later, get the cleaned-up transcript (spoken language)
+   plus Reply Buttons: Translate · Summarize · Help.
 
-Send a **text message** instead, and you'll get a reply asking you to send
-a voice note (or use `/help`). Send `/help`, `/urdu`, `/english`, `/roman`,
-`/translate`, or `/summarize` to try the commands.
+**Translate / Summarize**
+- Tap **Translate**, pick a language (or Other… and type one).
+- Tap **Summarize** for bullet points in the transcript's language.
+- After either result, tap **Listen** to hear it as audio.
+
+**Text → voice**
+- Send any message with at least 5 letters/numbers.
+- Tap **🔊 Convert to Voice**.
 
 Watch the `uvicorn` terminal for structured log lines tracing each step of
 the pipeline, plus a single JSON analytics line (`"event":
@@ -321,6 +331,7 @@ are logged as last-4-digits only, for privacy).
 3. Deploy. Railway uses `railway.toml` (nixpacks builder, start command,
    `/health` healthcheck) — no `Procfile` changes needed for Railway
    specifically, but it's included for Heroku-style compatibility too.
+   Keep **one** web replica (in-memory caches are not shared).
 4. **Before the app can actually work**, run the migration once against
    the deployed database:
    ```bash
@@ -330,4 +341,3 @@ are logged as last-4-digits only, for privacy).
    automatically by the app or by `Procfile`/`railway.toml`, by design.
 5. Update the webhook URL in the Meta App Dashboard to your Railway
    service's public URL (`https://<your-app>.up.railway.app/webhook`).
-

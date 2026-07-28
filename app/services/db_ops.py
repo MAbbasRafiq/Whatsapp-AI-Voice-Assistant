@@ -30,9 +30,7 @@ async def touch_user(wa_phone: str) -> tuple[User, bool]:
     Ensure a `users` row exists for `wa_phone` and update `last_seen`.
 
     Returns (user, is_new_user). `is_new_user` is True only the very
-    first time this phone number is ever seen — used to decide whether
-    to show the first-time onboarding block (Part 5) vs the regular
-    footer (Part 6).
+    first time this phone number is ever seen.
     """
     async with AsyncSessionLocal() as session:
         result = await session.execute(select(User).where(User.wa_phone == wa_phone))
@@ -68,26 +66,6 @@ async def is_blocked(wa_phone: str) -> bool:
         return bool(value)
 
 
-async def get_preferred_language(wa_phone: str) -> str | None:
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(select(User.preferred_language).where(User.wa_phone == wa_phone))
-        return result.scalar_one_or_none()
-
-
-async def set_preferred_language(wa_phone: str, language: str) -> None:
-    """language must be one of 'urdu' | 'english' | 'roman'."""
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(select(User).where(User.wa_phone == wa_phone))
-        user = result.scalar_one_or_none()
-        if user is None:
-            # Shouldn't normally happen (touch_user runs first for every
-            # message), but guard against it defensively.
-            user = User(wa_phone=wa_phone)
-            session.add(user)
-        user.preferred_language = language
-        await session.commit()
-
-
 async def record_message(wa_message_id: str, wa_phone: str, status: str = "received") -> bool:
     """
     Insert a row into `messages` for deduplication purposes.
@@ -119,14 +97,18 @@ async def update_message_status(wa_message_id: str, status: str) -> None:
             await session.commit()
 
 
-async def increment_daily_usage(wa_phone: str) -> int:
+async def try_consume_daily_usage(wa_phone: str, limit: int) -> tuple[bool, int]:
     """
-    Atomically increment today's (UTC) voice note count for `wa_phone`
-    and return the new count.
+    Atomically reserve one daily voice-note slot for `wa_phone` if under
+    `limit`.
 
-    Uses PostgreSQL's `INSERT ... ON CONFLICT DO UPDATE` so concurrent
-    increments for the same user/day can't race and undercount (a plain
-    SELECT-then-UPDATE would have a lost-update race).
+    Returns (allowed, count):
+      - (True, new_count) when a unit was consumed (new_count is 1..limit).
+      - (False, current_count) when already at/over limit — the counter is
+        NOT incremented, so rejected spam cannot inflate usage forever.
+
+    Uses PostgreSQL `INSERT ... ON CONFLICT DO UPDATE ... WHERE` so
+    concurrent consumes cannot race past the cap.
     """
     # Use UTC explicitly (not date.today(), which is local server time) —
     # the daily quota must reset at midnight UTC regardless of where the
@@ -140,13 +122,52 @@ async def increment_daily_usage(wa_phone: str) -> int:
             .on_conflict_do_update(
                 index_elements=[UsageDaily.wa_phone, UsageDaily.day],
                 set_={"voice_count": UsageDaily.voice_count + 1},
+                where=UsageDaily.voice_count < limit,
             )
             .returning(UsageDaily.voice_count)
         )
         result = await session.execute(stmt)
-        new_count = result.scalar_one()
-        await session.commit()
-        return new_count
+        new_count = result.scalar_one_or_none()
+        if new_count is not None:
+            await session.commit()
+            return True, int(new_count)
+
+        await session.rollback()
+        current = await session.execute(
+            select(UsageDaily.voice_count).where(
+                UsageDaily.wa_phone == wa_phone,
+                UsageDaily.day == today,
+            )
+        )
+        current_count = current.scalar_one_or_none()
+        return False, int(current_count if current_count is not None else limit)
+
+
+async def refund_daily_usage(wa_phone: str) -> None:
+    """
+    Best-effort undo of one `try_consume_daily_usage` reservation when
+    the voice pipeline fails before a successful transcript reply.
+    Never raises — quota accounting must not block error handling.
+    """
+    today = datetime.now(timezone.utc).date()
+    try:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(UsageDaily).where(
+                    UsageDaily.wa_phone == wa_phone,
+                    UsageDaily.day == today,
+                )
+            )
+            row = result.scalar_one_or_none()
+            if row is None or row.voice_count <= 0:
+                return
+            row.voice_count -= 1
+            await session.commit()
+    except Exception:
+        logger.exception(
+            "Failed to refund daily usage | wa_phone=%s",
+            wa_phone,
+        )
 
 
 async def save_transcript(wa_phone: str, language: str, text: str) -> None:

@@ -4,8 +4,9 @@ End-to-end voice note processing pipeline.
 Orchestrates: daily-quota check -> download audio from WhatsApp -> file
 size / duration pre-checks -> convert to WAV -> transcribe with Groq
 Whisper -> clean up with a Groq LLM (always in the original detected
-language — no auto-translate) -> save transcript + reply on WhatsApp
-with interactive Reply Buttons -> log a structured analytics event.
+language — users translate themselves via Translate) -> save transcript
++ reply on WhatsApp with interactive Reply Buttons -> log a structured
+analytics event.
 
 Designed to run as a FastAPI `BackgroundTask`, scheduled from the webhook
 router *after* WhatsApp has already been acknowledged with a 200 (see
@@ -71,21 +72,29 @@ async def process_voice_note(
     detected_language = None
     audio_duration_sec = None
     transcript_char_count = 0
+    quota_reserved = False
+    pipeline_succeeded = False
 
     # A new voice note always cancels any pending "Other language..." wait.
     clear_waiting_for_language(sender)
 
     try:
-        # --- Daily quota check — before any download, so an over-quota
-        # user doesn't cost us bandwidth/ffmpeg time. --------------------
-        new_count = await db_ops.increment_daily_usage(sender)
-        if new_count > settings.daily_voice_limit:
+        # --- Daily quota — reserve one slot before any download so an
+        # over-quota user doesn't cost us bandwidth/ffmpeg time. Failed
+        # pipelines refund below so flaky media/Groq doesn't burn the day.
+        allowed, _count = await db_ops.try_consume_daily_usage(
+            sender, settings.daily_voice_limit
+        )
+        if not allowed:
             await send_user_error(
                 sender, ErrorType.DAILY_LIMIT, limit=settings.daily_voice_limit
             )
             await _safe_update_status(wa_message_id, "failed")
-            _log_result(sender, wa_message_id, "failed", None, None, timings, 0, "daily_limit_exceeded", start_time)
+            _log_result(
+                sender, wa_message_id, "failed", None, None, timings, 0, "daily_limit_exceeded", start_time
+            )
             return
+        quota_reserved = True
 
         processing_sent = await send_text_message(sender, PROCESSING_MESSAGE)
         if not processing_sent:
@@ -124,7 +133,13 @@ async def process_voice_note(
             input_path.write_bytes(audio_bytes)
 
             audio_duration_sec = await probe_duration_seconds(input_path)
-            if audio_duration_sec > MAX_DURATION_SECONDS:
+            if not audio_duration_sec:
+                logger.warning(
+                    "Could not determine audio duration, skipping duration check | sender=%s | id=%s",
+                    mask_phone(sender),
+                    wa_message_id,
+                )
+            if audio_duration_sec and audio_duration_sec > MAX_DURATION_SECONDS:
                 await send_user_error(sender, ErrorType.DURATION_TOO_LONG)
                 await _safe_update_status(wa_message_id, "failed")
                 _log_result(
@@ -146,7 +161,8 @@ async def process_voice_note(
             )
             return
 
-        # --- Cleanup in the ORIGINAL detected language (no auto-translate)
+        # --- Cleanup in the ORIGINAL detected language (no auto-translate).
+        # Users pick a target themselves via Translate after the reply.
         effective_detected = resolve_effective_language(detected_language)
 
         cleanup_start = time.monotonic()
@@ -154,6 +170,30 @@ async def process_voice_note(
             raw_transcript, detected_language, target_language=None
         )
         timings["llm_cleanup_time_sec"] = round(time.monotonic() - cleanup_start, 2)
+
+        if not cleaned_text.strip():
+            logger.error(
+                "LLM cleanup returned empty result for non-empty transcript | "
+                "sender=%s | id=%s | raw_chars=%d",
+                mask_phone(sender),
+                wa_message_id,
+                len(raw_transcript),
+            )
+            await send_user_error(sender, ErrorType.VOICE_PROCESSING_FAILED)
+            await _safe_update_status(wa_message_id, "failed")
+            _log_result(
+                sender,
+                wa_message_id,
+                "failed",
+                detected_language,
+                audio_duration_sec,
+                timings,
+                0,
+                "empty_cleanup_result",
+                start_time,
+            )
+            return
+
         transcript_char_count = len(cleaned_text)
 
         final_language_key = effective_detected.strip().lower()
@@ -161,9 +201,11 @@ async def process_voice_note(
 
         # Persist + cache before replying — if sending the reply fails
         # partway through chunking, the transcript is still safely saved
-        # and available to Translate / Summarize.
+        # and available to Translate / Summarize. Quota is considered
+        # earned once we have a usable transcript.
         await db_ops.save_transcript(sender, final_language_key, cleaned_text)
         set_last_transcript(sender, cleaned_text, final_language_key)
+        pipeline_succeeded = True
 
         reply = f"🌐 Language: {display_label}\n\n{cleaned_text}"
         transcript_sent = await send_long_message(sender, reply)
@@ -190,17 +232,17 @@ async def process_voice_note(
 
         # Second message: interactive Reply Buttons. If Meta rejects the
         # interactive payload (permissions, API issues, etc.), fall back
-        # to the legacy slash-command footer so the user isn't stuck.
+        # to a short text note so the user isn't stuck.
         buttons_sent = await send_post_transcript_actions(sender)
         if not buttons_sent:
             logger.warning(
-                "Reply buttons failed; sending slash-command fallback | sender=%s",
+                "Reply buttons failed; sending text fallback | sender=%s",
                 mask_phone(sender),
             )
             fallback_sent = await send_text_message(sender, slash_command_fallback_footer())
             if not fallback_sent:
                 logger.error(
-                    "Failed to send slash-command fallback after transcript | sender=%s",
+                    "Failed to send buttons-unavailable fallback after transcript | sender=%s",
                     mask_phone(sender),
                 )
 
@@ -227,6 +269,9 @@ async def process_voice_note(
             error_type.value,
             start_time,
         )
+    finally:
+        if quota_reserved and not pipeline_succeeded:
+            await db_ops.refund_daily_usage(sender)
 
 
 async def _safe_update_status(wa_message_id: str, status: str) -> None:

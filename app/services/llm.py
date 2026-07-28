@@ -372,15 +372,6 @@ async def cleanup_transcript(
     return cleaned
 
 
-_BUILTIN_TRANSLATE_TARGETS = {
-    "english": "english",
-    "urdu": "urdu",
-    # Roman Urdu is handled by a dedicated translate path — reusing
-    # cleanup_transcript pulls in English few-shot examples and a
-    # "formatter" persona that often drifts into plain English.
-}
-
-
 def _normalize_language_key(language: str) -> str:
     return " ".join((language or "").strip().lower().replace("-", " ").replace("_", " ").split())
 
@@ -459,10 +450,12 @@ async def translate_transcript(
     Translate an already-cleaned transcript (from the in-memory last-
     transcript cache) into `target_language` without re-running Whisper.
 
-    Built-in targets english / urdu reuse the cleanup machinery (same
-    "don't summarize" guarantees). Roman Urdu uses a dedicated prompt so
-    the model does not drift into plain English. Any other language name
-    gets a dedicated translation prompt (Arabic, French, Chinese, etc.).
+    Roman Urdu uses a dedicated prompt (with few-shot examples) so the
+    model does not drift into plain English. All other targets — including
+    english and urdu — use `_build_translate_system_prompt`. We deliberately
+    do NOT reuse `cleanup_transcript` here: its Urdu-script few-shot examples
+    can override a translate-to-English system instruction and leave the
+    output in Urdu.
     """
     if not cleaned_text.strip():
         return ""
@@ -473,12 +466,6 @@ async def translate_transcript(
 
     if _is_roman_urdu_target(target_language):
         return await _translate_to_roman_urdu(cleaned_text)
-
-    builtin = _BUILTIN_TRANSLATE_TARGETS.get(target_key)
-    if builtin is not None:
-        return await cleanup_transcript(
-            cleaned_text, source_language, target_language=builtin
-        )
 
     client = _get_groq_client()
     completion = await client.chat.completions.create(

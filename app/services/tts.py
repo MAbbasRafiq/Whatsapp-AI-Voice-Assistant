@@ -118,9 +118,8 @@ def _normalize_language_key(language: str) -> str:
         return key
     if key in _LANGUAGE_ALIASES:
         return _LANGUAGE_ALIASES[key]
-    # Multi-word: "Brazilian Portuguese", "Mandarin Chinese"
-    if key in _LANGUAGE_ALIASES or key in _VOICE_MAP:
-        return _LANGUAGE_ALIASES.get(key, key)
+    # Multi-word lookups (e.g. "Brazilian Portuguese", "Mandarin Chinese")
+    # are handled by splitting and matching each part below.
     for part in key.replace("-", " ").split():
         if part in _VOICE_MAP:
             return part
