@@ -331,14 +331,3 @@ are logged as last-4-digits only, for privacy).
 5. Update the webhook URL in the Meta App Dashboard to your Railway
    service's public URL (`https://<your-app>.up.railway.app/webhook`).
 
-## Notes / what's NOT implemented yet
-
-- No `/history` command yet, though `transcripts` already stores
-  everything needed for one in a future phase.
-- Rate limiting and the last-transcript cache are in-memory and
-  per-process — they reset on restart and won't work correctly if this
-  app is ever scaled to multiple concurrent instances (fine for a single
-  Railway web process today; would need a shared store like Redis to scale
-  horizontally).
-- Blocking a user is manual, direct-SQL only (`UPDATE users SET
-  is_blocked = true WHERE wa_phone = '...'`) — no admin command/API yet.

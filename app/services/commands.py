@@ -87,9 +87,9 @@ _LANGUAGE_LIST_ROWS: list[tuple[str, str]] = [
 
 # Kept as a public alias — same wording as ErrorType.NO_TRANSCRIPT.
 NO_TRANSCRIPT_REPLY = (
-    "I couldn't find a recent transcript.\n"
-    "Remember voice expires after 15 min\n"
-    "Send a new voice note."
+    "⌛ Your previous transcript has expired.\n"
+    "For your privacy, transcripts are kept for only 15 minutes.\n"
+    "🎤 Send a new voice note to continue."
 )
 
 _ASK_OTHER_LANGUAGE = "🌍 Type the language you'd like to translate into."

@@ -105,9 +105,9 @@ _ERROR_MESSAGES: dict[ErrorType, str] = {
         "Please try again in a minute."
     ),
     ErrorType.NO_TRANSCRIPT: (
-        "I couldn't find a recent transcript.\n"
-        "Remember voice expires after 15 min\n"
-        "Send a new voice note."
+        "⌛ Your previous transcript has expired.\n"
+        "For your privacy, transcripts are kept for only 15 minutes.\n"
+        "🎤 Send a new voice note to continue."
     ),
     ErrorType.UNSUPPORTED_LANGUAGE: (
         "⚠️ I couldn't translate into that language. "
