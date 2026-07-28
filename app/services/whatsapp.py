@@ -159,6 +159,96 @@ async def send_reply_buttons(
     return await _post_message(to, payload, log_label="reply buttons")
 
 
+async def upload_media(
+    audio_bytes: bytes,
+    mime_type: str = "audio/mpeg",
+) -> str:
+    """
+    Upload binary media to Meta's WhatsApp media endpoint.
+
+    POST /{phone_number_id}/media with multipart form fields
+    messaging_product=whatsapp, type=<mime_type>, file=<bytes>.
+
+    Returns the media_id string. Raises on missing config, HTTP error,
+    or unexpected response shape — callers turn failures into user-facing
+    messages (same pattern as `get_media_info` / `download_media`).
+    """
+    if not settings.whatsapp_token or not settings.whatsapp_phone_number_id:
+        raise RuntimeError(
+            "WHATSAPP_TOKEN or WHATSAPP_PHONE_NUMBER_ID is not configured; "
+            "cannot upload media."
+        )
+
+    url = f"{GRAPH_API_BASE_URL}/{settings.whatsapp_phone_number_id}/media"
+    headers = {"Authorization": f"Bearer {settings.whatsapp_token}"}
+    data = {
+        "messaging_product": "whatsapp",
+        "type": mime_type,
+    }
+    files = {
+        "file": ("audio.mp3", audio_bytes, mime_type),
+    }
+
+    async with httpx.AsyncClient(timeout=MEDIA_REQUEST_TIMEOUT_SECONDS) as client:
+        response = await client.post(url, headers=headers, data=data, files=files)
+    response.raise_for_status()
+
+    payload = response.json()
+    media_id = payload.get("id")
+    if not media_id:
+        raise RuntimeError(
+            f"Graph API media upload returned no 'id' field: {payload}"
+        )
+
+    logger.info(
+        "Uploaded WhatsApp media | media_id=%s | bytes=%d | mime_type=%s",
+        media_id,
+        len(audio_bytes),
+        mime_type,
+    )
+    return str(media_id)
+
+
+async def send_audio_message(to: str, media_id: str) -> bool:
+    """
+    Send an audio WhatsApp message referencing a previously uploaded media_id.
+
+    Returns True on HTTP 2xx, False on config/HTTP/network failure.
+    Errors are logged and never raised (same pattern as `send_text_message`).
+    """
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": to,
+        "type": "audio",
+        "audio": {"id": media_id},
+    }
+    return await _post_message(to, payload, log_label="audio message")
+
+
+async def send_listen_button(to: str) -> bool:
+    """
+    Optional single Reply Button offered after a summary or translation.
+
+    Body: "🎧 Want to hear this?" — Button id=`tts_play`, title=`🔊 Listen`.
+
+    On failure: log a warning and return False — never raise. Listen is
+    optional and must not break the main summary/translate flow.
+    """
+    try:
+        sent = await send_reply_buttons(
+            to,
+            body="🎧 Want to hear this?",
+            buttons=[("tts_play", "🔊 Listen")],
+        )
+        if not sent:
+            logger.warning("Failed to send Listen button to %s", to)
+        return sent
+    except Exception:
+        logger.warning("Failed to send Listen button to %s", to, exc_info=True)
+        return False
+
+
 async def send_list_message(
     to: str,
     body: str,
