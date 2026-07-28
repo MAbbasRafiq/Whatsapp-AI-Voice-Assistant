@@ -173,13 +173,15 @@ async def process_voice_note(
 
         if not cleaned_text.strip():
             logger.error(
-                "LLM cleanup returned empty result for non-empty transcript | "
+                "LLM cleanup returned empty/unusable result for non-empty transcript | "
                 "sender=%s | id=%s | raw_chars=%d",
                 mask_phone(sender),
                 wa_message_id,
                 len(raw_transcript),
             )
-            await send_user_error(sender, ErrorType.VOICE_PROCESSING_FAILED)
+            # Prefer the honest "couldn't make out speech" message over a
+            # fake polished transcript (e.g. few-shot regurgitation).
+            await send_user_error(sender, ErrorType.EMPTY_TRANSCRIPT)
             await _safe_update_status(wa_message_id, "failed")
             _log_result(
                 sender,

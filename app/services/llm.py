@@ -189,9 +189,8 @@ Detected spoken language: {effective_source_language}
 
 Rules:
 - REMOVE ONLY pure fillers / hesitation sounds, for example:
-  um, uh, hmm, hm, er, ah, "you know", and "like" / "so" only when they
-  are empty fillers (not when they carry meaning, e.g. "like two weeks"
-  meaning approximately two weeks).
+  um, uh, hmm, hm, er, ah, only when they
+  are empty fillers (not when they carry meaning)
 - Do NOT remove repeated words or false starts. Messy spoken grammar is
   fine to keep (e.g. keep "I was going I was going to the store" as-is —
   do not collapse it to "I was going to the store").
@@ -231,6 +230,11 @@ Rules:
   the same length as the raw transcript (shorter only by the fillers you
   removed). Turning content into a smoother or shorter version is WRONG.
 - Do not add information that wasn't said.
+- CRITICAL — EXAMPLES ARE NOT THE INPUT: earlier messages in this chat are
+  practice examples only. Clean ONLY the last user message (the real
+  transcript). NEVER copy, reuse, paraphrase, or fall back to any example
+  text. If the real transcript is unclear, reply with an empty string
+  rather than inventing or repeating an example.
 - Reply with ONLY the cleaned-up text. No preamble, no explanations, no
   wrapping quotation marks.
 """
@@ -268,6 +272,48 @@ _EXAMPLE_MIXED_SCRIPT_CLEANED = (
     "ٹیبل بنا کر مجھے دکھائیں۔"
 )
 
+# Distinctive phrases from the English few-shot — used to catch partial
+# regurgitation that isn't a character-perfect match.
+_ENGLISH_FEW_SHOT_MARKERS = (
+    "project timeline",
+    "design team is still waiting on feedback from marketing",
+)
+
+
+def _normalize_for_compare(text: str) -> str:
+    return " ".join((text or "").lower().split())
+
+
+def _is_cleanup_example_echo(cleaned: str, raw: str) -> bool:
+    """
+    True when the model regurgitated a few-shot example instead of cleaning
+    the real Whisper transcript (e.g. Punjabi audio → fake English demo text).
+    """
+    cleaned_n = _normalize_for_compare(cleaned)
+    raw_n = _normalize_for_compare(raw)
+    if not cleaned_n:
+        return False
+
+    example_cleaned_n = _normalize_for_compare(_EXAMPLE_CLEANED_TRANSCRIPT)
+    example_raw_n = _normalize_for_compare(_EXAMPLE_RAW_TRANSCRIPT)
+    urdu_cleaned_n = _normalize_for_compare(_EXAMPLE_MIXED_SCRIPT_CLEANED)
+    urdu_raw_n = _normalize_for_compare(_EXAMPLE_MIXED_SCRIPT_RAW)
+
+    # Real input already was the example (astronomically rare) — allow.
+    if raw_n in {example_cleaned_n, example_raw_n, urdu_cleaned_n, urdu_raw_n}:
+        return False
+
+    if cleaned_n in {example_cleaned_n, example_raw_n, urdu_cleaned_n, urdu_raw_n}:
+        return True
+
+    # Partial English few-shot echo: both markers in output, neither in input.
+    if all(marker in cleaned_n for marker in _ENGLISH_FEW_SHOT_MARKERS) and not any(
+        marker in raw_n for marker in _ENGLISH_FEW_SHOT_MARKERS
+    ):
+        return True
+
+    return False
+
 
 async def cleanup_transcript(
     raw_transcript: str,
@@ -294,9 +340,10 @@ async def cleanup_transcript(
             saved `preferred_language` that differs from what they
             actually spoke this time (Part 5 of Phase 3).
 
-    Returns the cleaned text. Raises on API failure — the caller (the
-    voice note processing pipeline) is responsible for turning that into
-    a user-facing error message.
+    Returns the cleaned text, or "" if cleanup fails / regurgitates a
+    few-shot example. Raises on API failure — the caller (the voice note
+    processing pipeline) is responsible for turning that into a
+    user-facing error message.
     """
     if not raw_transcript.strip():
         # Nothing to clean up — let the caller decide how to handle an
@@ -326,6 +373,16 @@ async def cleanup_transcript(
             temperature=0.2,
         )
         cleaned = (completion.choices[0].message.content or "").strip()
+
+        if _is_cleanup_example_echo(cleaned, raw_transcript):
+            logger.error(
+                "Cleanup LLM echoed a few-shot example; discarding output | "
+                "detected_language=%s | raw_chars=%d | cleaned_chars=%d",
+                detected_language,
+                len(raw_transcript),
+                len(cleaned),
+            )
+            return ""
 
         leftover_words = sorted(set(_DEVANAGARI_RUN_RE.findall(cleaned)))
         if not leftover_words:
@@ -371,6 +428,12 @@ async def cleanup_transcript(
                 _MAX_DEVANAGARI_RETRIES,
                 leftover_words,
             )
+
+    if _is_cleanup_example_echo(cleaned, raw_transcript):
+        logger.error(
+            "Cleanup LLM echoed a few-shot example after Devanagari retries; discarding"
+        )
+        return ""
 
     return cleaned
 
