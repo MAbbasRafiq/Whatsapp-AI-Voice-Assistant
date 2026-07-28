@@ -18,8 +18,9 @@ import re
 from app.config import settings
 from app.services import db_ops
 from app.services.llm import resolve_effective_language, summarize_transcript, translate_transcript
+from app.services.rate_limiter import release_tts, try_acquire_tts
 from app.services.transcript_cache import get_last_transcript
-from app.services.tts import generate_speech
+from app.services.tts import UnsupportedTtsLanguageError, detect_language_from_text, generate_speech
 from app.services.tts_cache import get_tts_cache, set_tts_cache
 from app.services.user_errors import (
     ErrorType,
@@ -44,9 +45,6 @@ from app.services.whatsapp import (
 from app.utils import mask_phone
 
 logger = logging.getLogger(__name__)
-
-# Arabic / Urdu script block — used by /tts to pick a voice.
-_ARABIC_URDU_SCRIPT_RE = re.compile(r"[\u0600-\u06FF]")
 
 # --- Interactive message IDs (must match what we send) --------------------
 BTN_TRANSLATE = "action_translate"
@@ -97,8 +95,12 @@ NO_TRANSCRIPT_REPLY = (
 _ASK_OTHER_LANGUAGE = "🌍 Type the language you'd like to translate into."
 
 DEFAULT_REPLY = (
-    "🎤 Send me a voice note and I'll convert it to clean text!\n\n"
-    "Or tap Help after a transcript for tips."
+    "🎤 Send me a voice note and I'll convert it into clean text.\n\n"
+    "🔊 Want to convert text into speech?\n"
+    "Use:\n"
+    "`/voice Your text here`\n\n"
+    "Example:\n"
+    "`/voice Hello everyone`"
 )
 
 _SLASH_FALLBACK_FOOTER = "──────────────\n💡 /translate • /summarize • /roman • /help"
@@ -114,6 +116,7 @@ _HELP_TEXT = """\
 • Send a voice note to receive a transcript.
 • Use Translate to convert it into another language.
 • Use Summarize to generate key points.
+• Use /voice <text> to convert any text into speech.
 • The voice message expires after 15 min
 
 To translate into any language not listed,
@@ -124,7 +127,7 @@ _HELP_TEXT_SLASH_TEMPLATE = """\
 
 /translate — Translate last transcript to English
 /summarize — Summarize last transcript
-/tts <text> — Convert any text to voice
+/voice <text> — Convert any text to voice
 /urdu — Set language to Urdu (اردو)
 /english — Set language to English
 /roman — Set language to Roman Urdu
@@ -144,8 +147,29 @@ _TTS_FAILED_REPLY = (
 )
 
 _TTS_USAGE_REPLY = (
-    "Please provide text after /tts\n"
-    "Example: /tts Hello everyone"
+    "Please provide text after /voice\n"
+    "Example: /voice Hello everyone"
+)
+
+_TTS_RENAMED_REPLY = (
+    "🔄 /tts has been renamed to /voice\n\n"
+    "Example: /voice Hello everyone"
+)
+
+_TTS_BUSY_REPLY = "⏳ Audio is already being generated. Please wait a moment."
+
+_TTS_RATE_LIMITED_REPLY = (
+    "⏳ Please wait a few seconds before generating more audio."
+)
+
+_TTS_TRUNCATED_NOTICE = (
+    "⚠️ Note: the audio was shortened to fit the length limit."
+)
+
+_TTS_UNSUPPORTED_LANGUAGE_TEMPLATE = (
+    "⚠️ I can't generate speech for {language} yet.\n"
+    "Supported: English, Urdu, Roman Urdu, Arabic, French, German, "
+    "Hindi, Chinese, Turkish, Russian, Spanish, Italian, Portuguese, Korean."
 )
 
 
@@ -187,8 +211,15 @@ async def handle_command(wa_phone: str, text: str) -> None:
             await _translate_last(wa_phone, "English")
         elif command == "summarize":
             await _summarize_last(wa_phone)
-        elif command == "tts":
+        elif command == "voice":
             await _handle_tts_command(wa_phone, text)
+        elif command == "tts":
+            sent = await send_text_message(wa_phone, _TTS_RENAMED_REPLY)
+            if not sent:
+                logger.error(
+                    "Failed to send /tts rename reply | wa_phone=%s",
+                    mask_phone(wa_phone),
+                )
         elif command in ("urdu", "english", "roman"):
             await _handle_set_preference(wa_phone, command)
         elif command == "help":
@@ -448,30 +479,78 @@ async def _summarize_last(wa_phone: str) -> None:
 
 
 def _detect_tts_language(text: str) -> str:
-    """Pick urdu voice when Arabic/Urdu script is present; else english."""
-    if _ARABIC_URDU_SCRIPT_RE.search(text):
-        return "urdu"
+    """Infer language for /voice from script; default english for Latin text."""
+    detected = detect_language_from_text(text)
+    if detected == "unsupported":
+        # Let generate_speech raise UnsupportedTtsLanguageError with context.
+        return "unsupported"
+    if detected:
+        return detected
     return "english"
 
 
 async def _generate_and_send_audio(wa_phone: str, text: str, language: str) -> None:
     """
-    Shared TTS pipeline: status text → synthesize → upload → send audio.
+    Shared TTS pipeline: gate → status → synthesize → upload → send audio.
 
-    Raises on failure so callers can show a friendly error.
+    Raises on synthesis/upload/send failure so callers can show a friendly
+    error. Busy / rate-limit rejections are handled here (user message sent,
+    no raise).
     """
-    status_sent = await send_text_message(wa_phone, "🔊 Generating audio...")
-    if not status_sent:
-        logger.warning(
-            "Failed to send TTS status message | wa_phone=%s",
+    gate = try_acquire_tts(wa_phone)
+    if gate == "busy":
+        sent = await send_text_message(wa_phone, _TTS_BUSY_REPLY)
+        if not sent:
+            logger.error(
+                "Failed to send TTS busy reply | wa_phone=%s",
+                mask_phone(wa_phone),
+            )
+        return
+    if gate == "rate_limited":
+        sent = await send_text_message(wa_phone, _TTS_RATE_LIMITED_REPLY)
+        if not sent:
+            logger.error(
+                "Failed to send TTS rate-limit reply | wa_phone=%s",
+                mask_phone(wa_phone),
+            )
+        return
+
+    try:
+        status_sent = await send_text_message(wa_phone, "🔊 Generating audio...")
+        if not status_sent:
+            logger.warning(
+                "Failed to send TTS status message | wa_phone=%s",
+                mask_phone(wa_phone),
+            )
+
+        result = await generate_speech(text, language)
+        if result.truncated:
+            notice_sent = await send_text_message(wa_phone, _TTS_TRUNCATED_NOTICE)
+            if not notice_sent:
+                logger.warning(
+                    "Failed to send TTS truncation notice | wa_phone=%s",
+                    mask_phone(wa_phone),
+                )
+
+        media_id = await upload_media(result.audio_bytes)
+        audio_sent = await send_audio_message(wa_phone, media_id)
+        if not audio_sent:
+            raise RuntimeError("WhatsApp rejected audio message send")
+    finally:
+        release_tts(wa_phone)
+
+
+async def _reply_tts_failure(wa_phone: str, exc: BaseException) -> None:
+    if isinstance(exc, UnsupportedTtsLanguageError):
+        message = _TTS_UNSUPPORTED_LANGUAGE_TEMPLATE.format(language=exc.language)
+    else:
+        message = _TTS_FAILED_REPLY
+    sent = await send_text_message(wa_phone, message)
+    if not sent:
+        logger.error(
+            "Failed to send TTS failure reply | wa_phone=%s",
             mask_phone(wa_phone),
         )
-
-    mp3_bytes = await generate_speech(text, language)
-    media_id = await upload_media(mp3_bytes)
-    audio_sent = await send_audio_message(wa_phone, media_id)
-    if not audio_sent:
-        raise RuntimeError("WhatsApp rejected audio message send")
 
 
 async def _handle_tts_play(wa_phone: str) -> None:
@@ -489,31 +568,26 @@ async def _handle_tts_play(wa_phone: str) -> None:
     text, language = cached
     try:
         await _generate_and_send_audio(wa_phone, text, language)
-    except Exception:
+    except Exception as exc:
         logger.exception(
             "TTS play failed | wa_phone=%s | language=%r",
             mask_phone(wa_phone),
             language,
         )
-        sent = await send_text_message(wa_phone, _TTS_FAILED_REPLY)
-        if not sent:
-            logger.error(
-                "Failed to send TTS failure reply | wa_phone=%s",
-                mask_phone(wa_phone),
-            )
+        await _reply_tts_failure(wa_phone, exc)
 
 
 async def _handle_tts_command(wa_phone: str, raw_text: str) -> None:
     """
-    /tts <text> — synthesize arbitrary text. No LLM reply; audio only.
+    /voice <text> — synthesize arbitrary text. No LLM reply; audio only.
     """
-    match = re.match(r"(?i)^/tts\s*(.*)$", raw_text.strip(), flags=re.DOTALL)
+    match = re.match(r"(?i)^/voice\s*(.*)$", raw_text.strip(), flags=re.DOTALL)
     tts_text = (match.group(1) if match else "").strip()
     if not tts_text:
         sent = await send_text_message(wa_phone, _TTS_USAGE_REPLY)
         if not sent:
             logger.error(
-                "Failed to send /tts usage reply | wa_phone=%s",
+                "Failed to send /voice usage reply | wa_phone=%s",
                 mask_phone(wa_phone),
             )
         return
@@ -521,18 +595,13 @@ async def _handle_tts_command(wa_phone: str, raw_text: str) -> None:
     language = _detect_tts_language(tts_text)
     try:
         await _generate_and_send_audio(wa_phone, tts_text, language)
-    except Exception:
+    except Exception as exc:
         logger.exception(
-            "/tts failed | wa_phone=%s | language=%r",
+            "/voice failed | wa_phone=%s | language=%r",
             mask_phone(wa_phone),
             language,
         )
-        sent = await send_text_message(wa_phone, _TTS_FAILED_REPLY)
-        if not sent:
-            logger.error(
-                "Failed to send /tts failure reply | wa_phone=%s",
-                mask_phone(wa_phone),
-            )
+        await _reply_tts_failure(wa_phone, exc)
 
 
 async def _handle_set_preference(wa_phone: str, language: str) -> None:
