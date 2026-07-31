@@ -57,14 +57,15 @@ class Settings(BaseSettings):
     # Max voice notes a single user can process per UTC calendar day.
     daily_voice_limit: int = 20
 
-    # --- Supabase Storage (background voice archival) ------------------------
+    # --- Supabase (background archival) --------------------------------------
     # Project URL from Supabase Dashboard → Project Settings → API.
-    # Used only to archive raw voice notes; never blocks user replies.
+    # Used for voice Storage uploads and tts_texts table inserts; never
+    # blocks user replies.
     supabase_url: str = ""
 
-    # Service role key (secret) from the same API page. Bypasses Storage RLS
-    # so the bot can write to the private voice-recordings bucket. Never
-    # expose this key in client-side code.
+    # Service role key (secret) from the same API page. Bypasses RLS so the
+    # bot can write to Storage / Postgres. Never expose this key in
+    # client-side code.
     supabase_service_role_key: str = ""
 
     # Private Storage bucket name for archived voice notes. Object keys are

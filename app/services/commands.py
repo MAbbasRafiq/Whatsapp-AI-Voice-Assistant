@@ -27,6 +27,7 @@ from app.services.text_to_voice_cache import get_pending_text, set_pending_text
 from app.services.transcript_cache import get_last_transcript
 from app.services.tts import UnsupportedTtsLanguageError, detect_language_from_text, generate_speech
 from app.services.tts_cache import get_tts_cache, set_tts_cache
+from app.services.tts_text_storage import schedule_tts_text_archive
 from app.services.user_errors import (
     ErrorType,
     classify_for_request,
@@ -649,6 +650,9 @@ async def _handle_text_to_voice(wa_phone: str) -> None:
                 mask_phone(wa_phone),
             )
         return
+
+    # Archive typed text before TTS — fire-and-forget; never blocks replies.
+    schedule_tts_text_archive(wa_phone, text)
 
     language = _detect_tts_language(text)
     try:
