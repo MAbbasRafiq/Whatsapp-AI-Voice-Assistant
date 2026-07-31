@@ -447,15 +447,28 @@ def _is_roman_urdu_target(target_language: str) -> bool:
     return key in {"roman", "roman urdu", "urdu roman"}
 
 
+# Exact sentinel the translate model must return when the requested target
+# is not a real/recognizable natural language (see prompt rules below).
+INVALID_LANGUAGE = "INVALID_LANGUAGE"
+
+
 def _build_translate_system_prompt(source_language: str, target_language: str) -> str:
     source = resolve_effective_language(source_language) or "the source language"
     target = (target_language or "").strip() or "English"
     return f"""\
 You translate voice note transcripts for a WhatsApp voice notes app.
 
-Translate the input text from {source} into {target}.
+The requested target language name is: {target}
 
-Rules:
+First decide whether "{target}" is a real/recognizable natural language
+(e.g. English, Urdu, Spanish, French, Mandarin, Hindi, Arabic, German).
+- If it IS a valid language name: translate the input text from {source}
+  into that language.
+- If it is NOT a valid language name (a person name, gibberish, a random
+  word, etc.): NEVER guess or substitute Urdu, English, or any other
+  language. Reply with exactly {INVALID_LANGUAGE} and nothing else.
+
+Rules (only when translating):
 - Preserve every idea, sentence, and detail — do NOT summarize.
 - Keep the original meaning and tone.
 - Write fluent, natural {target}.

@@ -16,7 +16,12 @@ import logging
 import re
 
 from app.config import settings
-from app.services.llm import resolve_effective_language, summarize_transcript, translate_transcript
+from app.services.llm import (
+    INVALID_LANGUAGE,
+    resolve_effective_language,
+    summarize_transcript,
+    translate_transcript,
+)
 from app.services.rate_limiter import release_tts, try_acquire_tts
 from app.services.text_to_voice_cache import get_pending_text, set_pending_text
 from app.services.transcript_cache import get_last_transcript
@@ -95,12 +100,16 @@ NO_TRANSCRIPT_REPLY = (
 
 _ASK_OTHER_LANGUAGE = "🌍 Type the language you'd like to translate into."
 
+
+def _invalid_language_message(user_input: str) -> str:
+    return f'⚠️ "{user_input}" isn\'t a recognized language. Enter a valid language name.'
+
 DEFAULT_REPLY = (
-    "🎤 Send me a voice note and I'll convert it into clean text.\n\n"
-    "After each transcript, use the buttons to Translate, Summarize, or get Help.\n\n"
-    "🔊 Want to convert text into speech?\n"
-    "Send a short message (a few words or more) and tap Convert to Voice."
+    "🎤 Send a voice note to get a clean transcript.\n\n"
+    "Use the buttons to *Translate*, *Summarize*, or get *Help*.\n\n"
+    "🔊 Or send any text to convert it into voice."
 )
+
 
 # Shown only when Reply Buttons cannot be delivered (Graph API rejection).
 _BUTTONS_UNAVAILABLE_FOOTER = (
@@ -111,17 +120,15 @@ _BUTTONS_UNAVAILABLE_FOOTER = (
 
 _HELP_TEXT_TEMPLATE = """\
 🤖 Voice Assistant
-• Send a voice note to receive a transcript (in the spoken language).
-• Tap Translate to convert it into another language.
-• Tap Summarize to generate key points.
-• Tap Listen after a translation/summary to hear it as audio.
-• Send any text and tap Convert to Voice to hear it spoken.
+• Send a voice note to receive a transcript.
+• Tap *Translate* to convert it into another language.
+• Tap *Summarize* to generate key points.
+• Tap *Listen* after a translation or summary to hear it as audio.
+• Send any text and tap *Convert to Voice* to hear it spoken.
 • Transcripts expire after 15 minutes.
 
-To translate into a language not listed,
-choose Other language... and type the language name.
-
-Max 3 min per note • Max {daily_limit} notes/day"""
+💬 Feedback or issues: abbasrafiq82@gmail.com"""
+# Max 3 min per note • Max {daily_limit} notes/day"""
 
 _TEXT_TO_VOICE_PROMPT = "What would you like to do with this text?"
 _TEXT_TO_VOICE_BUTTONS: list[tuple[str, str]] = [
@@ -130,7 +137,7 @@ _TEXT_TO_VOICE_BUTTONS: list[tuple[str, str]] = [
 
 _TTS_EXPIRED_REPLY = (
     "⌛ The audio has expired (15 min).\n"
-    "Please request a new summary or translation."
+    "Request a new summary or translation."
 )
 
 _TEXT_TO_VOICE_EXPIRED_REPLY = (
@@ -153,10 +160,10 @@ _TTS_RENAMED_REPLY = (
     "Example: /voice Hello everyone"
 )
 
-_TTS_BUSY_REPLY = "⏳ Audio is already being generated. Please wait a moment."
+_TTS_BUSY_REPLY = "⏳ Audio is already being generated. Wait a moment."
 
 _TTS_RATE_LIMITED_REPLY = (
-    "⏳ Please wait a few seconds before generating more audio."
+    "⏳ Wait a few seconds before generating more audio."
 )
 
 _TTS_TRUNCATED_NOTICE = (
@@ -165,8 +172,6 @@ _TTS_TRUNCATED_NOTICE = (
 
 _TTS_UNSUPPORTED_LANGUAGE_TEMPLATE = (
     "⚠️ I can't generate speech for {language} yet.\n"
-    "Supported: English, Urdu, Roman Urdu, Arabic, French, German, "
-    "Hindi, Chinese, Turkish, Russian, Spanish, Italian, Portuguese, Korean."
 )
 
 
@@ -249,7 +254,7 @@ def slash_command_fallback_footer() -> str:
 
 
 def _help_text() -> str:
-    return _HELP_TEXT_TEMPLATE.format(daily_limit=settings.daily_voice_limit)
+    return _HELP_TEXT_TEMPLATE
 
 
 async def handle_command(wa_phone: str, text: str) -> None:
@@ -355,7 +360,7 @@ async def handle_language_input(wa_phone: str, language_text: str) -> None:
             return
 
     try:
-        await _translate_last(wa_phone, language)
+        await _translate_last(wa_phone, language, waiting_for_retry=True)
     except Exception as exc:
         logger.exception(
             "Language-input translation failed | wa_phone=%s | language=%r",
@@ -434,7 +439,12 @@ async def _send_post_action_buttons(wa_phone: str, *, context: str) -> None:
             )
 
 
-async def _translate_last(wa_phone: str, target_language: str) -> None:
+async def _translate_last(
+    wa_phone: str,
+    target_language: str,
+    *,
+    waiting_for_retry: bool = False,
+) -> None:
     cached = get_last_transcript(wa_phone)
     if cached is None:
         clear_waiting_for_language(wa_phone)
@@ -452,6 +462,16 @@ async def _translate_last(wa_phone: str, target_language: str) -> None:
         )
         await send_user_error(wa_phone, classify_for_translate(exc))
         clear_waiting_for_language(wa_phone)
+        return
+
+    if translated.strip() == INVALID_LANGUAGE:
+        # Free-text "Other language..." path: re-enter waiting so the user
+        # can type another language name without tapping Translate again.
+        sent = await send_text_message(wa_phone, _invalid_language_message(target_language))
+        if waiting_for_retry and sent:
+            set_waiting_for_language(wa_phone)
+        else:
+            clear_waiting_for_language(wa_phone)
         return
 
     if not translated.strip():
